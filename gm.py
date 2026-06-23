@@ -42,74 +42,56 @@ except ImportError:
 #
 #  SOURCES
 #  -------
-#  This script scrapes TWO independent Gambian job sources and feeds both
-#  into the same dedup tracker / paraphrase / WordPress-posting / Excel-export
-#  pipeline:
+#  Two URLs were requested:
 #
-#    1) PSC (Personnel Services Commission) - https://pscgov.gm/vacancies-1/
-#       A single Elementor accordion page holding every current civil-service
-#       vacancy. No per-job emails or external apply URLs; every posting
-#       points at the same e-recruitment portal (https://portal.pscgov.gm).
+#    * https://gamjobs.com/                 -> REAL source (scraped here). A standard
+#                                              JobMonster WordPress board: a paginated
+#                                              /jobs/ archive of listing cards, each
+#                                              linking to a /jobs/<slug>/ detail page.
+#    * https://gambia.gov.gm/vacancies/     -> NOT a listing source. It is the official
+#                                              government "gateway" page; its only job
+#                                              content is two buttons linking out to the
+#                                              PSC site and to GamJobs. The scraper still
+#                                              *reads* it (resolve_gov_gateway) to confirm
+#                                              GamJobs as the live source and to surface
+#                                              PSC as the other official source — but the
+#                                              jobs themselves come from GamJobs.
 #
-#    2) Gamjobs - https://gamjobs.com/jobs/
-#       A JobMonster/WP-Job-Manager style board: paginated listing pages,
-#       per-job detail pages with structured "Job Overview" meta, real
-#       per-employer "How to Apply" sections (public emails or URLs, no
-#       login wall), categories, locations and employer logos. Per the
-#       site's own taxonomy this also includes tenders/RFPs/RFQs/EOIs
-#       alongside ordinary vacancies -- by design, all of it is scraped.
-#
-#  APPLY-METHOD NOTE (PSC only)
-#  -----------------------------
-#  Every PSC posting shares ONE application method: complete form 16(A/B/C)
-#  on the e-recruitment portal https://portal.pscgov.gm (requires candidate
-#  registration). There are no per-job emails or external apply URLs. This
-#  collides with the hard "public-apply-only" rule used elsewhere.
-#
-#  PSC_PORTAL_AS_APPLY (default "1"/on):
-#     on  -> the public portal URL counts as a valid apply destination; jobs post.
-#     off -> jobs are treated as non-qualifying and written to the flagged CSV
-#            instead of being posted (strict public-apply behaviour).
-#
-#  Gamjobs postings carry their own real apply email/URL per listing, so they
-#  are not subject to the PSC_PORTAL_AS_APPLY toggle.
+#  APPLY RULE (hard, network-wide)
+#  -------------------------------
+#  A job only posts if it exposes a PUBLIC apply path: an email or an external apply
+#  URL found in its "How to Apply" text. GamJobs' on-page "Apply for this job" button
+#  just opens a login/registration modal, so it is NEVER treated as a valid apply
+#  destination. Jobs without a public email/URL are written to the flagged CSV.
+#  REQUIRE_PUBLIC_APPLY (default "1"/on) enforces this; set to "0" to post everything.
 # =============================================================================
 
-BASE_URL      = "https://pscgov.gm"
-VACANCIES_URL = os.environ.get("PSC_VACANCIES_URL", "https://pscgov.gm/vacancies-1/")
+BASE_URL  = "https://gamjobs.com"
+JOBS_URL  = os.environ.get("GAMJOBS_JOBS_URL", "https://gamjobs.com/jobs/")
 
-# The single, constant application destination for every PSC vacancy.
-PSC_PORTAL_URL = os.environ.get("PSC_PORTAL_URL", "https://portal.pscgov.gm/")
-# PSC is the recruiting body; use its logo for every posting unless overridden.
-PSC_LOGO_URL = os.environ.get(
-    "PSC_LOGO_URL",
-    "https://pscgov.gm/wp-content/uploads/2022/06/cropped-PSCLOGO-270x270.png",
-)
-PSC_WEBSITE = "https://pscgov.gm/"
+# Official government gateway page (no listings of its own — links to GamJobs + PSC).
+GOV_GATEWAY_URL = os.environ.get("GAMBIA_GOV_VACANCIES_URL",
+                                 "https://gambia.gov.gm/vacancies/")
+# If the gateway page is reachable, follow the GamJobs link it advertises.
+FOLLOW_GOV_GATEWAY = os.environ.get("FOLLOW_GOV_GATEWAY", "1") != "0"
 
-# Treat the (public, external) e-recruitment portal as a valid apply URL.
-PSC_PORTAL_AS_APPLY = os.environ.get("PSC_PORTAL_AS_APPLY", "1") != "0"
-
-# ── Gamjobs ──────────────────────────────────────────────────────────────────
-GAMJOBS_ENABLED   = os.environ.get("GAMJOBS_ENABLED", "1") != "0"
-GAMJOBS_BASE_URL  = "https://gamjobs.com"
-GAMJOBS_JOBS_URL  = os.environ.get("GAMJOBS_JOBS_URL", "https://gamjobs.com/jobs/")
-GAMJOBS_WEBSITE   = "https://gamjobs.com/"
-GAMJOBS_MAX_PAGES = int(os.environ.get("GAMJOBS_MAX_PAGES", "0"))  # 0 = no cap
+# Enforce the public-apply-only rule (email or external URL required to post).
+REQUIRE_PUBLIC_APPLY = os.environ.get("REQUIRE_PUBLIC_APPLY", "1") != "0"
 
 REQUEST_DELAY   = float(os.environ.get("REQUEST_DELAY", "1.0"))
-MAX_JOBS        = int(os.environ.get("MAX_JOBS", "0"))
+MAX_JOBS        = int(os.environ.get("MAX_JOBS", "0"))     # 0 = unlimited
+MAX_PAGES       = int(os.environ.get("MAX_PAGES", "15"))   # archive pagination cap
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "25"))
 
-OUTPUT_FILE        = "gambia_jobs.xlsx"
-PROCESSED_IDS_FILE = "gambia_jobs_processed.csv"
-FLAGGED_FILE       = "gambia_jobs_flagged.csv"
+OUTPUT_FILE        = "gamjobs_gambia_jobs.xlsx"
+PROCESSED_IDS_FILE = "gamjobs_gambia_processed.csv"
+FLAGGED_FILE       = "gamjobs_gambia_flagged.csv"
 
 # CSV column names — defined once so _init_tracker, load, and upsert all agree.
 _TRACKER_FIELDS = ["Job ID", "Job URL", "Job Title", "Company Name",
                    "Status", "Timestamp", "WP ID"]
 
-_FLAGGED_FIELDS = ["Source", "Title", "Ministry", "Location", "Salary",
+_FLAGGED_FIELDS = ["Source", "Title", "Company", "Location", "Salary",
                    "Deadline", "Reason", "Apply Note", "Job URL", "Timestamp"]
 
 # ── WordPress ────────────────────────────────────────────────────────────────
@@ -143,7 +125,7 @@ JOB_TYPE_MAPPING = {
     "part-time": "part-time", "part time": "part-time",
     "contract":  "contract",  "temporary": "temporary",
     "internship":"internship","freelance": "freelance",
-    "volunteer": "volunteer",
+    "volunteer": "volunteer", "permanent": "full-time",
 }
 
 HEADERS = {
@@ -158,14 +140,28 @@ HEADERS = {
 SESSION = requests.Session()
 SESSION.headers.update(HEADERS)
 
-# Known Gambian towns/cities, used to pull a location out of free text.
+# Known Gambian towns/cities, used as a fallback to pull a location from free text.
 GAMBIA_LOCATIONS = [
     "Banjul", "Abuko", "Brikama", "Bakau", "Serrekunda", "Serekunda",
-    "Kanifing", "Old Yundum", "Yundum", "Basse", "Farafenni", "Soma",
-    "Kerewan", "Mansakonko", "Janjanbureh", "Kuntaur", "Sukuta", "Gunjur",
-    "Lamin", "Bwiam", "Kanilai", "Essau", "Barra", "Kotu", "Fajara",
+    "Kanifing", "Old Yundum", "New Yundum", "Yundum", "Basse", "Farafenni",
+    "Soma", "Kerewan", "Mansakonko", "Janjangbureh", "Kuntaur", "Sukuta",
+    "Gunjur", "Lamin", "Bwiam", "Kanilai", "Essau", "Barra", "Kotu", "Fajara",
+    "Bakoteh", "Bijilo", "Brusubi", "Brufut", "Kololi", "Tanji", "Tallinding",
+    "Latrikunda", "Manjai", "Jabang", "Kairaba Avenue",
 ]
-DEFAULT_LOCATION = os.environ.get("PSC_DEFAULT_LOCATION", "Banjul")
+# GamJobs uses "The Gambia" as the country-level catch-all location.
+DEFAULT_LOCATION = os.environ.get("GAMJOBS_DEFAULT_LOCATION", "The Gambia")
+
+# Hosts/paths that are never a real external apply destination.
+_NON_APPLY_HOST_SUBSTR = (
+    "gamjobs.com", "facebook.", "twitter.", "x.com", "linkedin.",
+    "instagram.", "wa.me", "whatsapp", "t.me", "telegram",
+    "plus.google", "pinterest.", "youtube.",
+)
+_NON_APPLY_PATH_SUBSTR = (
+    "/member-2", "action=login", "mode=register", "#share", "/share",
+    "/wp-login", "/cart", "/checkout",
+)
 
 # =============================================================================
 #  LOGGING / COLOUR
@@ -192,39 +188,12 @@ def log(msg):
     print(msg, flush=True)
 
 EMAIL_PATTERN = re.compile(r"[A-Za-z0-9.+_-]+@[A-Za-z0-9-]+\.[A-Za-z0-9.-]+")
+URL_PATTERN   = re.compile(r"https?://[^\s)>\"']+", re.I)
 
 TRACKING_PARAM_PREFIXES = ("utm_",)
 TRACKING_PARAM_EXACT = {
     "fbclid", "gclid", "msclkid", "mc_cid", "mc_eid", "ref", "referrer",
 }
-
-# Headers that delimit the sections inside a single vacancy block.
-# Sorted longest-first at match time so "QUALIFICATION AND EXPERIENCE" wins over
-# "QUALIFICATION", etc.
-SECTION_HEADERS = [
-    "VACANCY ANNOUNCEMENT",
-    "JOB PURPOSE",
-    "JOB TITLE",
-    "NUMBER OF VACANCIES",
-    "QUALIFICATION AND EXPERIENCE",
-    "QUALIFICATIONS",
-    "QUALIFICATION",
-    "DUTIES AND RESPONSIBILITIES",
-    "DUTIES AND RESPONSIBILTIES",   # site frequently misspells this
-    "KEY RESPONSIBILITIES",
-    "COMPETENCIES/ SKILLS",
-    "COMPETENCIES/SKILLS",
-    "COMPETENCIES",
-    "SKILLS AND ABILITIES",
-    "SKILLS",
-    "OUTPUTS/DELIVERABLES",
-    "OUTPUTS",
-    "SALARY",
-    "APPLICATION FORMAT",
-    "CLOSING DATE",
-    "APPLICATION DEADLINE",
-]
-_HEADERS_BY_LEN = sorted(SECTION_HEADERS, key=len, reverse=True)
 
 MONTHS = {
     "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
@@ -233,14 +202,38 @@ MONTHS = {
     "aug": 8, "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dec": 12,
 }
 
-DATE_RE = re.compile(
+# Ordinal text date e.g. "30th June 2026" / "7th July, 2026".
+TEXT_DATE_RE = re.compile(
     r"(\d{1,2})\s*(?:st|nd|rd|th)?\s+([A-Za-z]+)\s*[.,]?\s*(\d{4})", re.I
 )
+# Numeric DD/MM/YYYY or DD-MM-YYYY (GamJobs meta line + Job Overview).
+DMY_DATE_RE = re.compile(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b")
 
-# Gamjobs detail pages render the deadline as DD/MM/YYYY (sometimes as a
-# "publish - expiry" range); this pattern handles that format separately
-# from the PSC "7th June 2026" style handled by DATE_RE above.
-SLASH_DATE_RE = re.compile(r"(\d{1,2})/(\d{1,2})/(\d{4})")
+# Labels inside the JobMonster "Job Overview" box.
+DEADLINE_LABELS = ("application deadline", "closing date", "deadline",
+                   "expiry date", "expires")
+
+# Body headings that introduce the application instructions. Anchored (^) and
+# used against a *stripped, short* line so it never trips on "Application
+# Deadline:" / "Application Format" inside the Job Overview box.
+APPLY_HEADING_RE = re.compile(
+    r"^(how\s*to\s*apply|to\s*apply|mode\s*of\s*application|method\s*of\s*application|"
+    r"application\s*(?:procedure|process|instructions?|method|guidelines?)|"
+    r"submission\s*of\s*applications?|how\s*to\s*submit)\b", re.I
+)
+
+# Boilerplate that marks the end of usable post content on a detail page.
+_BODY_CUT_MARKERS = [
+    "related jobs", "leave your thoughts", "you must be logged in",
+    "email me jobs like these", "send to a friend", "company information",
+    "leave a reply", "post a comment",
+]
+# Standalone UI lines to drop from the description.
+_BODY_DROP_LINES = {
+    "apply for this job", "save", "share", "share:", "bookmark job",
+    "quick view", "send to friend", "send to a friend", "clear all",
+    "filter", "view more",
+}
 
 # =============================================================================
 #  TEXT CLEANUP / SANITIZATION
@@ -337,141 +330,72 @@ def html_block_to_text(el) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
-def _normalize_header_line(line: str):
-    """
-    If `line` begins with one of the known section headers (ignoring markdown
-    decoration and case), return (CANONICAL_HEADER, inline_remainder). Else None.
-    """
-    stripped = line.strip()
-    if not stripped:
-        return None
-    # Drop leading markdown decoration: #, *, •, -, whitespace.
-    bare = re.sub(r"^[#*•\-\s]+", "", stripped)
-    bare = bare.replace("*", "")
-    upper = bare.upper()
-    for header in _HEADERS_BY_LEN:
-        if upper.startswith(header):
-            remainder = bare[len(header):]
-            remainder = remainder.lstrip(" :–-").strip()
-            # Guard: a real header is short. Avoid matching a sentence that merely
-            # starts with the word "SKILLS"/"SALARY" mid-paragraph by requiring the
-            # remainder to be empty or to look like a value (not a long sentence)
-            # for the very short headers.
-            if header in ("SKILLS", "SALARY", "QUALIFICATION", "COMPETENCIES",
-                          "OUTPUTS") and len(remainder.split()) > 18:
-                continue
-            return header, remainder
-    return None
-
-def segment_sections(text: str) -> dict:
-    """Split a vacancy's text into {CANONICAL_HEADER: content} sections."""
-    sections = {}
-    current = "_PREAMBLE"
-    buf = []
-
-    def flush():
-        if buf:
-            existing = sections.get(current, "")
-            joined = "\n".join(buf).strip()
-            sections[current] = (existing + "\n" + joined).strip() if existing else joined
-
-    for line in text.split("\n"):
-        hdr = _normalize_header_line(line)
-        if hdr:
-            flush()
-            buf = []
-            current = hdr[0]
-            if hdr[1]:
-                buf.append(hdr[1])
-        else:
-            if line.strip():
-                buf.append(line.strip())
-    flush()
-    return sections
-
-def section(sections: dict, *names) -> str:
-    for n in names:
-        if sections.get(n):
-            return sections[n].strip()
-    return ""
-
 # =============================================================================
-#  GAMBIA-SPECIFIC EXTRACTORS
+#  DATE / FIELD EXTRACTORS
 # =============================================================================
 
-def parse_gambia_date(text: str) -> str:
-    """
-    Parse a closing-date string into 'YYYY-MM-DD'. Handles ordinals
-    (7th, 2nd, 19th), optional commas, and ranges like
-    '19th June – 18th July, 2026' (returns the later/end date).
-    """
-    if not text:
-        return ""
-    matches = DATE_RE.findall(text)
-    if not matches:
-        return ""
-    # Walk matches newest-last; return the last one whose month name is real
-    # (covers "start – end, YEAR" ranges -> end date, and ignores stray matches).
-    for day_s, mon_s, year_s in reversed(matches):
-        month = MONTHS.get(mon_s.lower())
+def dmy_dates(text: str) -> list:
+    """Return ISO dates parsed from DD/MM/YYYY (or DD-MM-YYYY), in order."""
+    out = []
+    for d, m, y in DMY_DATE_RE.findall(text or ""):
+        try:
+            out.append(datetime(int(y), int(m), int(d)).strftime("%Y-%m-%d"))
+        except ValueError:
+            pass
+    return out
+
+def text_dates(text: str) -> list:
+    """Return ISO dates parsed from ordinal text form ('30th June 2026'), in order."""
+    out = []
+    for d, mon, y in TEXT_DATE_RE.findall(text or ""):
+        month = MONTHS.get(mon.lower())
         if not month:
             continue
         try:
-            return datetime(int(year_s), month, int(day_s)).strftime("%Y-%m-%d")
+            out.append(datetime(int(y), month, int(d)).strftime("%Y-%m-%d"))
         except ValueError:
-            continue
-    return ""
+            pass
+    return out
 
-def parse_slash_date(text: str, take_last=True) -> str:
-    """
-    Parse Gamjobs-style DD/MM/YYYY dates into 'YYYY-MM-DD'. When a listing
-    shows a "publish - expiry" range (e.g. '16/06/2026 - 30/06/2026'),
-    take_last=True returns the expiry (later) date.
-    """
-    if not text:
-        return ""
-    matches = SLASH_DATE_RE.findall(text)
-    if not matches:
-        return ""
-    ordered = list(reversed(matches)) if take_last else matches
-    for day_s, mon_s, year_s in ordered:
-        try:
-            return datetime(int(year_s), int(mon_s), int(day_s)).strftime("%Y-%m-%d")
-        except ValueError:
-            continue
-    return ""
+def parse_any_date(text: str) -> str:
+    """Best single date from a label value (prefers numeric, then text)."""
+    ds = dmy_dates(text)
+    if ds:
+        return ds[-1]
+    ts = text_dates(text)
+    return ts[-1] if ts else ""
 
-def extract_salary_gmd(text: str):
-    """
-    Return (salary_string, grade_string) from a SALARY section.
-    e.g. 'GMD 88,512 per annum (Grade 7)', 'Grade 7'.
-    """
-    if not text:
-        return "", ""
-    grade = ""
-    gm = re.search(r"Grade\s*([0-9]+)", text, re.I)
-    if gm:
-        grade = f"Grade {gm.group(1)}"
-    amt = ""
-    # Amounts on the PSC page appear as D88,512 / D 133,860.00 / GMD101, 892.00
-    # (note the stray space after the comma in some rows).
-    am = re.search(r"(?:GMD|D)\s*([0-9]{1,3}(?:,\s?[0-9]{3})*(?:\.[0-9]+)?)", text)
-    if am:
-        amt = re.sub(r"\s+", "", am.group(1))
-    if amt:
-        salary = f"GMD {amt} per annum"
-        if grade:
-            salary += f" ({grade})"
-        return salary, grade
-    if grade:
-        return grade, grade
-    return "", ""
+def clean_title(raw: str) -> str:
+    """Strip the trailing ' 1442 views' / 'views' counter from a detail H1."""
+    t = sanitize_text(raw)
+    t = re.sub(r"\s*\d[\d,]*\s*views?\s*$", "", t, flags=re.I)
+    t = re.sub(r"\s*views?\s*$", "", t, flags=re.I)
+    return t.strip()
+
+def map_job_type(raw: str) -> str:
+    key = (raw or "").lower().strip()
+    return JOB_TYPE_MAPPING.get(key, "full-time")
+
+def pick_location(locations: list) -> str:
+    """Prefer a specific town over the country-level 'The Gambia' catch-all."""
+    specific = [l for l in locations if l and l.strip().lower() not in ("the gambia", "gambia")]
+    if specific:
+        return specific[0].strip()
+    if locations:
+        return locations[0].strip()
+    return DEFAULT_LOCATION
+
+def location_from_text(text: str) -> str:
+    if text:
+        for town in GAMBIA_LOCATIONS:
+            if re.search(rf"\b{re.escape(town)}\b", text, re.I):
+                return "Serrekunda" if town.lower() == "serekunda" else town
+    return DEFAULT_LOCATION
 
 def extract_experience(qual_text: str) -> str:
-    """Pull a short experience requirement out of the qualifications text."""
     if not qual_text:
         return ""
-    m = re.search(r"at least\s+\d+\s+years?[^.\n;]*", qual_text, re.I)
+    m = re.search(r"(?:at least|minimum(?: of)?)\s+\d+\s+years?[^.\n;]*", qual_text, re.I)
     if m:
         return m.group(0).strip().rstrip(".")
     m = re.search(r"\b\d+\s+years?[^.\n;]*experience", qual_text, re.I)
@@ -479,60 +403,18 @@ def extract_experience(qual_text: str) -> str:
         return m.group(0).strip().rstrip(".")
     return ""
 
-def extract_ministry(title_hint: str, body_text: str) -> str:
-    """Resolve the recruiting ministry/employer for a vacancy."""
-    # 1) Parenthetical on the accordion title: "... (Ministry of Agriculture)-..."
-    if title_hint:
-        m = re.search(r"\(([^)]*Ministry[^)]*)\)", title_hint, re.I)
-        if m:
-            return re.sub(r"\s+", " ", m.group(1)).strip()
-    # 2) Body phrasing: "... at/under the Ministry of X, ..."
-    if body_text:
-        m = re.search(
-            r"(?:at|under|within)\s+the\s+(Ministry of [^.,\n;]+)", body_text, re.I
-        )
-        if m:
-            ministry = re.sub(r"\s+", " ", m.group(1)).strip()
-            # Trim trailing location fragments that sometimes ride along.
-            ministry = re.split(r"\s+(?:The Quadrangle|MECCNAR|Complex)\b",
-                                 ministry, flags=re.I)[0].strip()
-            return ministry
-    return "Government of The Gambia"
-
-def extract_location(body_text: str) -> str:
-    if body_text:
-        for town in GAMBIA_LOCATIONS:
-            if re.search(rf"\b{re.escape(town)}\b", body_text, re.I):
-                # Normalise a couple of spellings.
-                return "Serrekunda" if town.lower() == "serekunda" else town
-    return DEFAULT_LOCATION
-
-def build_description(sections: dict) -> str:
-    """Assemble the human-readable description (purpose + duties + skills)."""
-    parts = []
-    purpose = section(sections, "JOB PURPOSE")
-    if purpose:
-        parts.append(purpose)
-
-    vacancies = section(sections, "NUMBER OF VACANCIES")
-    if vacancies:
-        parts.append(f"Number of vacancies: {vacancies}")
-
-    duties = section(sections, "DUTIES AND RESPONSIBILITIES",
-                     "DUTIES AND RESPONSIBILTIES", "KEY RESPONSIBILITIES")
-    if duties:
-        parts.append("Duties and Responsibilities:\n" + duties)
-
-    skills = section(sections, "SKILLS AND ABILITIES", "COMPETENCIES/ SKILLS",
-                     "COMPETENCIES/SKILLS", "COMPETENCIES", "SKILLS")
-    if skills:
-        parts.append("Skills and Abilities:\n" + skills)
-
-    outputs = section(sections, "OUTPUTS/DELIVERABLES", "OUTPUTS")
-    if outputs:
-        parts.append("Outputs/Deliverables:\n" + outputs)
-
-    return "\n\n".join(p.strip() for p in parts if p.strip()).strip()
+def extract_salary(text: str) -> str:
+    """Best-effort salary. GamJobs rarely lists a figure; returns '' if none."""
+    if not text:
+        return ""
+    m = re.search(r"(?:GMD|D|GMD\s|D\s|₵)\s*([0-9]{1,3}(?:,\s?[0-9]{3})+(?:\.[0-9]+)?)", text)
+    if m:
+        amt = re.sub(r"\s+", "", m.group(1))
+        return f"GMD {amt}"
+    m = re.search(r"\b(?:salary|remuneration)\b[^.\n]{0,80}", text, re.I)
+    if m and re.search(r"\d", m.group(0)):
+        return m.group(0).strip().rstrip(".")
+    return ""
 
 # =============================================================================
 #  NLP TOOLS (lazy init, optional)
@@ -903,7 +785,7 @@ def write_flagged(raw_job: dict, reason: str, apply_note: str):
     try:
         with open(FLAGGED_FILE, "a", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow([
-                raw_job.get("source", "Unknown"),
+                "GamJobs",
                 raw_job.get("title", ""),
                 raw_job.get("company_name", ""),
                 raw_job.get("location", ""),
@@ -1053,542 +935,361 @@ def post_job_to_wordpress(job: dict) -> tuple:
     return None, None
 
 # =============================================================================
-#  STEP 1a — SCRAPE PSC (single Elementor accordion page)
+#  STEP 0 — OFFICIAL GOV GATEWAY (gambia.gov.gm/vacancies/)
+# =============================================================================
+#
+#  The government vacancies page carries no listings of its own; it only links
+#  out to GamJobs and to the PSC site. We read it to (a) confirm GamJobs as the
+#  live source and follow the exact URL it advertises, and (b) surface the PSC
+#  link as the other official source. If the page is unreachable we fall back to
+#  the configured GamJobs JOBS_URL.
 # =============================================================================
 
-def _find_job_blocks(soup: BeautifulSoup):
-    """
-    Return a list of (title_hint, body_text) tuples — one per vacancy.
+def resolve_gov_gateway() -> str:
+    """Return the GamJobs jobs URL to scrape, after consulting the gov gateway."""
+    if not FOLLOW_GOV_GATEWAY:
+        return JOBS_URL
+    print(C_BLUE(f"\n  Reading official gov gateway: {GOV_GATEWAY_URL}"))
+    try:
+        soup = get_soup(GOV_GATEWAY_URL)
+    except Exception as e:
+        log(C_DIM(f"  Gateway unreachable ({e}); using configured JOBS_URL."))
+        return JOBS_URL
 
-    Strategy A (DOM): pair Elementor accordion/toggle titles with their content
-    panels across the various widget class names Elementor has shipped.
-    Strategy B (text fallback): if DOM detection yields < 2 blocks, segment the
-    whole page text on 'JOB TITLE' anchors, which every posting contains.
-    """
-    blocks = []
+    gamjobs_links, psc_links = [], []
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        host = (urlparse(href).netloc or "").lower()
+        if "gamjobs.com" in host:
+            gamjobs_links.append(href)
+        elif "pscgov.gm" in host:
+            psc_links.append(href)
 
-    title_selectors = [
-        ".elementor-accordion .elementor-tab-title",
-        ".elementor-accordion .elementor-accordion-title",
-        ".elementor-toggle .elementor-tab-title",
-        ".elementor-toggle .elementor-toggle-title",
-        "details.e-n-accordion-item > summary",
-    ]
-    content_selectors = [
-        ".elementor-tab-content",
-        ".elementor-accordion-content",
-        ".elementor-toggle-content",
-        ".e-n-accordion-item-content",
-    ]
+    if psc_links:
+        log(C_DIM(f"  Gateway also lists PSC (other official source): {psc_links[0]}"))
+    if not gamjobs_links:
+        log(C_DIM("  Gateway did not expose a GamJobs link; using configured JOBS_URL."))
+        return JOBS_URL
 
-    for tsel in title_selectors:
-        titles = soup.select(tsel)
-        if not titles:
-            continue
-        for t in titles:
-            title_hint = clean_text(t)
-            body_el = None
-            # Look for the matching content panel: aria-controls -> id, else the
-            # next sibling content element, else nearest content descendant.
-            ctrl = t.get("aria-controls")
-            if ctrl:
-                body_el = soup.find(id=ctrl)
-            if body_el is None:
-                sib = t.find_next_sibling()
-                if sib is not None and any(
-                    cls in (sib.get("class") or [])
-                    for cls in ("elementor-tab-content", "elementor-accordion-content",
-                                "elementor-toggle-content", "e-n-accordion-item-content")
-                ):
-                    body_el = sib
-            if body_el is None:
-                # For <details><summary>, the content is the remaining children.
-                parent = t.parent
-                if parent is not None:
-                    body_el = parent
-            if body_el is not None and title_hint:
-                blocks.append((title_hint, html_block_to_text(body_el)))
-        if blocks:
-            break  # first selector family that works wins
-
-    # Filter DOM blocks to those that actually look like vacancies.
-    blocks = [(h, b) for (h, b) in blocks
-              if b and re.search(r"job\s*title|vacancy announcement|application format",
-                                 b, re.I)]
-
-    if len(blocks) >= 2:
-        return blocks
-
-    # ---- Strategy B: text segmentation fallback ----------------------------
-    log("  DOM accordion detection weak — falling back to text segmentation.")
-    main = (soup.select_one("main") or soup.select_one("#content")
-            or soup.select_one("article") or soup.body or soup)
-    full = html_block_to_text(main)
-
-    # Split on each 'JOB TITLE' marker. keep the delimiter with the following chunk.
-    pieces = re.split(r"(?im)^\s*(?:#+\s*|\*+\s*)?JOB\s*TITLE\s*:?", full)
-    # pieces[0] is the page preamble before the first job; skip it.
-    text_blocks = []
-    for chunk in pieces[1:]:
-        chunk = chunk.strip()
-        if not chunk:
-            continue
-        # The first line after the JOB TITLE marker is the title itself.
-        first_line = chunk.split("\n", 1)[0].strip(" :*").strip()
-        # Re-prepend a JOB TITLE header so segment_sections sees it.
-        rebuilt = "JOB TITLE: " + chunk
-        text_blocks.append((first_line, rebuilt))
-
-    return text_blocks if text_blocks else blocks
-
-def scrape_psc_vacancies():
-    """Fetch the PSC vacancies page and return a list of raw job dicts."""
-    log(f"\n{'='*80}\nFETCHING PSC VACANCIES PAGE: {VACANCIES_URL}\n{'='*80}")
-    soup = get_soup(VACANCIES_URL)
-
-    raw_blocks = _find_job_blocks(soup)
-    log(f"  Detected {len(raw_blocks)} vacancy block(s) on the page.")
-
-    today = datetime.now()
-    fallback_deadline = (today + timedelta(days=90)).strftime("%Y-%m-%d")
-
-    jobs = []
-    seen_anchor = set()
-
-    for title_hint, body_text in raw_blocks:
-        if not body_text:
-            continue
-        sections = segment_sections(body_text)
-
-        # Clean title: prefer the explicit JOB TITLE line.
-        title = section(sections, "JOB TITLE").split("\n")[0].strip()
-        if not title:
-            # Fall back to the accordion header, minus ministry parenthetical / month.
-            title = re.sub(r"\([^)]*\)", "", title_hint)
-            title = re.sub(r"[-–]\s*[A-Za-z]+\s*\d{4}\s*$", "", title).strip()
-        if not title:
-            continue
-
-        ministry  = extract_ministry(title_hint, body_text)
-        location  = extract_location(body_text)
-        qual      = section(sections, "QUALIFICATION AND EXPERIENCE",
-                            "QUALIFICATIONS", "QUALIFICATION")
-        experience = extract_experience(qual)
-        salary_section = section(sections, "SALARY")
-        salary, grade  = extract_salary_gmd(salary_section)
-        closing  = section(sections, "CLOSING DATE", "APPLICATION DEADLINE")
-        app_text = section(sections, "APPLICATION FORMAT")
-
-        deadline = parse_gambia_date(closing) or parse_gambia_date(app_text) or fallback_deadline
-
-        description = build_description(sections)
-        if not description:
-            # Last resort: use the preamble (the "Applications are invited..." text).
-            description = section(sections, "_PREAMBLE", "VACANCY ANNOUNCEMENT")
-
-        # Application destination: a real email if the posting ever lists one,
-        # otherwise the public e-recruitment portal.
-        apply_email = extract_email(app_text)
-        apply_url   = ""
-        portal_match = re.search(r"https?://portal\.pscgov\.gm/?", app_text, re.I)
-        if portal_match:
-            apply_url = portal_match.group(0)
-        elif re.search(r"portal", app_text, re.I):
-            apply_url = PSC_PORTAL_URL
-
-        # Stable, unique job_url for dedup (page + title/ministry slug).
-        anchor = slugify(f"{title}-{ministry}-{grade}")
-        if anchor in seen_anchor:
-            continue
-        seen_anchor.add(anchor)
-        job_url = f"{VACANCIES_URL}#{anchor}"
-
-        jobs.append({
-            "source":        "PSC Gambia",
-            "title":         title,
-            "job_url":       job_url,
-            "company_name":  ministry,
-            "location":      location,
-            "qualification": qual,
-            "experience":    experience,
-            "salary":        salary,
-            "grade":         grade,
-            "deadline":      deadline,
-            "description":   description,
-            "apply_url":     apply_url,
-            "apply_email":   apply_email,
-            "apply_text":    app_text,
-            "company_logo":  PSC_LOGO_URL,
-            "company_website": PSC_WEBSITE,
-            "source_page":   VACANCIES_URL,
-            "job_type":      "",
-        })
-
-    log(f"  Parsed {len(jobs)} unique vacancy record(s).")
-    return jobs
+    # Prefer a direct /jobs/ link; otherwise normalise the homepage link to /jobs/.
+    jobs_link = next((h for h in gamjobs_links if "/jobs" in urlparse(h).path), "")
+    if not jobs_link:
+        p = urlparse(gamjobs_links[0])
+        jobs_link = f"{p.scheme}://{p.netloc}/jobs/"
+    log(C_GREEN(f"  Gateway confirms GamJobs as live source -> {jobs_link}"))
+    return jobs_link
 
 # =============================================================================
-#  STEP 1b — SCRAPE GAMJOBS (paginated WP Job Manager / JobMonster board)
+#  STEP 1 — COLLECT JOB DETAIL URLS FROM THE GAMJOBS ARCHIVE (paginated)
 # =============================================================================
 
-def _gamjobs_listing_page_url(page_num: int) -> str:
-    if page_num <= 1:
-        return GAMJOBS_JOBS_URL
-    base = GAMJOBS_JOBS_URL.rstrip("/")
-    return f"{base}/?page={page_num}"
+def _norm_job_url(href: str) -> str:
+    """Canonicalise a /jobs/<slug>/ URL: https host, no query/fragment, trailing /."""
+    if not href:
+        return ""
+    absu = urljoin(BASE_URL + "/", href)
+    p = urlsplit(absu)
+    path = p.path
+    if not path.endswith("/"):
+        path += "/"
+    return urlunsplit(("https", p.netloc.lower(), path, "", ""))
 
-def _gamjobs_extract_listing_links(soup: BeautifulSoup) -> list:
-    """
-    Pull unique job detail-page URLs from a /jobs/ listing page. Job links are
-    <h3><a href=".../jobs/<slug>/"></a></h3> style headings inside job cards;
-    selecting on the href pattern is more robust than chasing card classes
-    across theme tweaks.
-    """
-    links = []
-    seen = set()
-    for a in soup.select("a[href]"):
-        href = a.get("href", "")
-        if not href or "/jobs/" not in href:
-            continue
-        # Skip taxonomy / pagination / filter links, only keep individual job
-        # detail permalinks: https://gamjobs.com/jobs/<slug>/
-        parsed = urlparse(href)
-        path = parsed.path.rstrip("/")
-        if not path.startswith("/jobs/"):
-            continue
-        slug = path[len("/jobs/"):]
-        if not slug or "?" in href.split("/jobs/")[-1]:
-            continue
-        # The bare listing root and its paginated variants aren't job detail pages.
-        if slug in ("", "page"):
-            continue
-        clean_url = urljoin(GAMJOBS_BASE_URL, path + "/")
-        if clean_url in seen:
-            continue
-        seen.add(clean_url)
-        links.append(clean_url)
-    return links
+def _is_job_detail_path(path: str) -> bool:
+    """True for /jobs/<slug>/ exactly (one segment after 'jobs', not 'page')."""
+    parts = [s for s in path.split("/") if s]
+    return len(parts) == 2 and parts[0] == "jobs" and parts[1].lower() != "page"
 
-def _gamjobs_total_count(soup: BeautifulSoup):
-    """Parse 'Showing 1–20 of 50 jobs' if present, to know when paging is done."""
-    text = clean_text(soup.body) if soup.body else ""
-    m = re.search(r"Showing\s+[\d,]+\s*[-–]\s*([\d,]+)\s+of\s+([\d,]+)\s+jobs", text, re.I)
-    if not m:
-        return None, None
-    shown_so_far = int(m.group(1).replace(",", ""))
-    total        = int(m.group(2).replace(",", ""))
-    return shown_so_far, total
+def _page_url(jobs_url: str, page: int) -> str:
+    if page <= 1:
+        return jobs_url
+    base = jobs_url if jobs_url.endswith("/") else jobs_url + "/"
+    return f"{base}page/{page}/"
 
-def gamjobs_collect_links(already_processed_urls: set) -> list:
-    """
-    Walk /jobs/ pagination, collecting detail-page URLs, until either:
-      - a page returns no new (unprocessed) links, or
-      - we've paged past the site's own reported total, or
-      - GAMJOBS_MAX_PAGES is hit (if configured as a safety cap).
-    """
-    log(f"\n{'='*80}\nFETCHING GAMJOBS LISTING: {GAMJOBS_JOBS_URL}\n{'='*80}")
-    all_links = []
-    seen_links = set()
-    page_num = 1
+def collect_job_links(jobs_url: str, max_pages: int = MAX_PAGES) -> list:
+    """Walk the archive pages and return ordered, de-duplicated detail URLs."""
+    print(C_BLUE(f"\n  Collecting job links from: {jobs_url}"))
+    seen, ordered = set(), []
+    empty_streak = 0
 
-    while True:
-        if GAMJOBS_MAX_PAGES and page_num > GAMJOBS_MAX_PAGES:
-            log(f"  Reached GAMJOBS_MAX_PAGES cap ({GAMJOBS_MAX_PAGES}), stopping pagination.")
-            break
-
-        page_url = _gamjobs_listing_page_url(page_num)
-        log(f"  Page {page_num}: {page_url}")
+    for page in range(1, max_pages + 1):
+        url = _page_url(jobs_url, page)
         try:
-            soup = get_soup(page_url)
+            soup = get_soup(url)
+        except requests.HTTPError as e:
+            log(C_DIM(f"  Page {page}: HTTP {getattr(e.response,'status_code','?')} — stopping."))
+            break
         except Exception as e:
-            log(C_RED(f"    FAILED to fetch page {page_num}: {e}"))
+            log(C_DIM(f"  Page {page}: fetch error ({e}) — stopping."))
             break
 
-        page_links = _gamjobs_extract_listing_links(soup)
-        new_links  = [u for u in page_links if u not in seen_links]
+        page_new = 0
+        for a in soup.find_all("a", href=True):
+            p = urlparse(a["href"])
+            # Anchor may be relative; resolve path for the test.
+            path = p.path or urlparse(urljoin(BASE_URL + "/", a["href"])).path
+            if not _is_job_detail_path(path):
+                continue
+            norm = _norm_job_url(a["href"])
+            if norm and norm not in seen:
+                seen.add(norm)
+                ordered.append(norm)
+                page_new += 1
 
-        if not page_links:
-            log("    No job links found on this page — stopping pagination.")
-            break
+        log(f"    Page {page}: {page_new} new job link(s) (total {len(ordered)})")
 
-        for u in new_links:
-            seen_links.add(u)
-            all_links.append(u)
-
-        new_unprocessed = [u for u in new_links if u not in already_processed_urls]
-        log(f"    Found {len(page_links)} link(s) on page "
-            f"({len(new_links)} new, {len(new_unprocessed)} unprocessed).")
-
-        shown, total = _gamjobs_total_count(soup)
-        if total is not None and shown is not None and shown >= total:
-            log(f"    Listing reports {shown}/{total} shown — reached end of results.")
-            break
-
-        # Stop once an entire page contributes nothing we haven't already
-        # tracked from a previous run — going further would just re-fetch
-        # jobs we already posted.
-        if page_num > 1 and not new_unprocessed and all(u in already_processed_urls for u in page_links):
-            log("    Entire page already in tracker — stopping pagination.")
-            break
+        if page_new == 0:
+            empty_streak += 1
+            # Two consecutive empty pages -> we've run off the end.
+            if empty_streak >= 2:
+                break
+        else:
+            empty_streak = 0
 
         time.sleep(REQUEST_DELAY)
-        page_num += 1
 
-        # Hard safety stop regardless of config, to avoid a runaway loop if the
-        # "Showing X of Y" marker ever goes missing on every page.
-        if page_num > 200:
-            log(C_RED("    Safety stop: exceeded 200 pages."))
-            break
+    return ordered
 
-    log(f"  Collected {len(all_links)} unique job detail link(s) across pagination.")
-    return all_links
+# =============================================================================
+#  STEP 2 — PARSE ONE GAMJOBS DETAIL PAGE
+# =============================================================================
 
-_OVERVIEW_LABELS = ["Vacancy Ref", "Department", "Reports To", "Location",
-                    "Employment Type", "Application Deadline", "Salary"]
+_CONTENT_SELECTORS = [
+    "div.job-description", "div.single-job-description", "div.noo-job-content",
+    "div.job-content", "div.job_description", "article .entry-content",
+    "div.entry-content", "main .entry-content", "div.page-content",
+]
 
-def _gamjobs_parse_overview(soup: BeautifulSoup) -> dict:
+def _find_content(soup):
+    """Return the element most likely to hold the job post body."""
+    best, best_len = None, 0
+    for sel in _CONTENT_SELECTORS:
+        el = soup.select_one(sel)
+        if el:
+            txt = el.get_text(" ", strip=True)
+            if len(txt) > best_len:
+                best, best_len = el, len(txt)
+        if best and best_len > 400:
+            return best
+    if best:
+        return best
+    # Last resort: <article>, then <main>, then <body>.
+    return soup.find("article") or soup.find("main") or soup.body or soup
+
+def _anchors_in(scope, needle):
+    out = []
+    for a in scope.find_all("a", href=True):
+        if needle in (urlparse(a["href"]).path or a["href"]):
+            t = a.get_text(" ", strip=True)
+            if t:
+                out.append(t)
+    return out
+
+def _is_real_apply_url(href: str) -> bool:
+    if not href:
+        return False
+    low = href.lower()
+    if low.startswith("mailto:") or low.startswith("#") or low.startswith("javascript:"):
+        return False
+    if not low.startswith("http"):
+        return False
+    if any(s in low for s in _NON_APPLY_HOST_SUBSTR):
+        return False
+    if any(s in low for s in _NON_APPLY_PATH_SUBSTR):
+        return False
+    return True
+
+def _split_description_and_apply(content_text: str):
     """
-    Pull the "Job Overview" key/value list. The Gamjobs job-description
-    Markdown is rendered so that each VALUE line is immediately followed by
-    its own bold LABEL line (value first, "**Label:**" second) rather than
-    the more conventional label-then-value order, e.g.:
-
-        Information Technology Department
-        **Department:**
-        Chief Technology Officer (CTO)
-        **Reports To:**
-
-    So for each known label we find the <strong>/<b> tag containing it and
-    take the text immediately *preceding* that tag (its previous sibling, or
-    the tail of the previous block) as the value, rather than text after it.
-    Falls back to a flat-text regex scan for layouts that do put value after
-    label, so both orderings are covered.
+    Given the cleaned body text, trim trailing boilerplate and split off the
+    'How to Apply' tail. Returns (description, apply_text).
     """
-    overview = {}
-    container = (soup.select_one(".job_overview, .job-overview, .job_listing-meta")
-                 or soup.select_one("article") or soup.body)
-    if container is None:
-        return overview
+    if not content_text:
+        return "", ""
 
-    seen_labels = {l.lower() for l in _OVERVIEW_LABELS}
-
-    for label in _OVERVIEW_LABELS:
-        label_re = re.compile(rf"^\s*{re.escape(label)}\s*:?\s*$", re.I)
-        tag = None
-        for candidate in container.find_all(["strong", "b"]):
-            if label_re.match(candidate.get_text(strip=True)):
-                tag = candidate
-                break
-        if tag is None:
+    lines = content_text.split("\n")
+    kept = []
+    for ln in lines:
+        low = ln.strip().lower()
+        if low in _BODY_DROP_LINES:
             continue
+        if any(low.startswith(m) for m in _BODY_CUT_MARKERS):
+            break
+        kept.append(ln)
+    body = "\n".join(kept).strip()
 
-        value = ""
-        prev = tag.find_previous(string=True)
-        steps = 0
-        while prev is not None and steps < 6:
-            candidate_text = prev.strip()
-            if candidate_text and candidate_text.lower().rstrip(":") not in seen_labels:
-                value = candidate_text
-                break
-            prev = prev.find_previous(string=True)
-            steps += 1
+    # Find the apply heading and split there.
+    apply_text = ""
+    description = body
+    m = APPLY_HEADING_RE.search(body)
+    if m:
+        # Keep a little context: description is everything before the heading line.
+        head_start = body.rfind("\n", 0, m.start()) + 1
+        description = body[:head_start].strip() or body[:m.start()].strip()
+        apply_text = body[m.start():].strip()
+    return description, apply_text
 
-        if value:
-            overview[label] = value
+def scrape_job_detail(url: str) -> dict:
+    """Parse a single GamJobs /jobs/<slug>/ page into a raw_job dict."""
+    soup = get_soup(url)
 
-    if not overview:
-        # Fallback: flat-text "Label: value" on one line (covers themes that
-        # render label-then-value in normal reading order).
-        text_block = clean_text(container)
-        for label in _OVERVIEW_LABELS:
-            m = re.search(rf"{re.escape(label)}\s*:?\s*([^\n]+?)(?=\s+(?:{'|'.join(_OVERVIEW_LABELS)})\b|$)",
-                          text_block, re.I)
-            if m:
-                overview[label] = m.group(1).strip(" -:")
+    # --- Title --------------------------------------------------------------
+    h1 = (soup.select_one("h1.page-title") or soup.select_one("h1.job-title")
+          or soup.select_one("h1.entry-title") or soup.find("h1"))
+    title = clean_title(h1.get_text(" ", strip=True) if h1 else "")
 
-    return overview
-
-def _gamjobs_extract_apply(soup: BeautifulSoup, page_text: str):
-    """
-    Find the real public apply destination from a Gamjobs detail page: prefer
-    an explicit URL/email under a 'How to Apply' heading, then fall back to
-    any email/external link in the page body. Returns (apply_url, apply_email).
-    """
-    apply_url = ""
-    apply_email = ""
-
-    how_to_apply = soup.find(string=re.compile(r"how\s+to\s+apply", re.I))
-    search_scope = soup
-    if how_to_apply:
-        # Search within the section following the "How to Apply" heading.
-        parent = how_to_apply.find_parent(["h1", "h2", "h3", "h4", "strong", "p"])
-        if parent:
-            following = parent.find_all_next(limit=15)
-            for el in following:
-                if el.name == "a" and el.get("href"):
-                    href = el.get("href", "")
-                    if href.startswith("mailto:"):
-                        apply_email = href[len("mailto:"):].split("?")[0]
-                        break
-                    if href.startswith("http") and "gamjobs.com" not in href:
-                        apply_url = strip_tracking_params(href)
-                        break
-
-    if not apply_url and not apply_email:
-        # Fall back: any external (non-gamjobs) link or mailto in the body.
-        for a in soup.select("a[href]"):
-            href = a.get("href", "")
-            if href.startswith("mailto:"):
-                apply_email = href[len("mailto:"):].split("?")[0]
-                break
-            if href.startswith("http") and "gamjobs.com" not in href and "facebook" not in href \
-               and "twitter" not in href and "linkedin" not in href and "instagram" not in href \
-               and "whatsapp" not in href.lower():
-                apply_url = strip_tracking_params(href)
-                break
-
-    if not apply_email:
-        apply_email = extract_email(page_text)
-
-    return apply_url, apply_email
-
-def _gamjobs_extract_logo(soup: BeautifulSoup) -> str:
-    og = soup.select_one('meta[property="og:image"]')
+    # --- Logo (og:image is the employer logo on this theme) -----------------
+    logo = ""
+    og = soup.find("meta", attrs={"property": "og:image"}) or \
+         soup.find("meta", attrs={"name": "og:image"})
     if og and og.get("content"):
-        return og["content"]
-    img = soup.select_one(".company_logo img, .company-logo img")
-    if img and img.get("src"):
-        return urljoin(GAMJOBS_BASE_URL, img["src"])
-    return ""
+        logo = og["content"].strip()
+    if not logo:
+        emp_img = soup.select_one('a[href*="/employers/"] img')
+        if emp_img and emp_img.get("src"):
+            logo = emp_img["src"].strip()
 
-def _gamjobs_extract_company(soup: BeautifulSoup) -> tuple:
-    """Return (company_name, company_url) from the employer link near the title."""
-    link = soup.select_one('a[href*="/employers/"]')
-    if link:
-        name = clean_text(link)
-        url  = urljoin(GAMJOBS_BASE_URL, link.get("href", ""))
-        return name or "Unknown Employer", url
-    return "Unknown Employer", ""
+    # --- Employer / company -------------------------------------------------
+    company_name = ""
+    company_url  = ""
+    emp_a = soup.select_one('a[href*="/employers/"]')
+    if emp_a:
+        company_name = emp_a.get_text(" ", strip=True)
+        company_url  = urljoin(BASE_URL + "/", emp_a["href"])
+    if not company_name:
+        company_name = "GamJobs Employer"
 
-def scrape_gamjobs_detail(job_url: str):
-    """Fetch and parse a single Gamjobs job/tender detail page into a raw job dict."""
-    try:
-        soup = get_soup(job_url)
-    except Exception as e:
-        log(C_RED(f"    FAILED to fetch {job_url}: {e}"))
-        return None
+    # Company's own website (sidebar, title="Website") + address.
+    company_website = ""
+    site_a = soup.find("a", attrs={"title": "Website"})
+    if site_a and site_a.get("href") and site_a["href"].startswith("http") \
+            and "gamjobs.com" not in site_a["href"].lower():
+        company_website = site_a["href"].strip()
 
-    page_text = clean_text(soup.body) if soup.body else ""
+    company_address = ""
+    full_addr_label = soup.find(string=re.compile(r"Full Address", re.I))
+    if full_addr_label:
+        parent = getattr(full_addr_label, "parent", None)
+        if parent:
+            txt = parent.get_text(" ", strip=True)
+            company_address = re.sub(r".*Full Address[:\s]*", "", txt, flags=re.I).strip()
 
-    title_el = soup.select_one("h1")
-    title = clean_text(title_el) if title_el else ""
-    # Strip the trailing "NNN views" counter some themes append to <h1>.
-    title = re.sub(r"\s*\d[\d,]*\s+views\s*$", "", title, flags=re.I).strip()
-    if not title:
-        return None
+    # --- Meta taxonomies ----------------------------------------------------
+    job_type_opts  = _anchors_in(soup, "/job-type/")
+    location_opts  = _anchors_in(soup, "/job-location/")
+    category_opts  = _anchors_in(soup, "/job-category/")
 
-    company_name, company_url = _gamjobs_extract_company(soup)
+    job_type = map_job_type(job_type_opts[0]) if job_type_opts else "full-time"
+    location = pick_location(location_opts)
+    job_field = ", ".join(dict.fromkeys(category_opts)) if category_opts else ""
 
-    job_type = ""
-    type_link = soup.select_one('a[href*="/job-type/"]')
-    if type_link:
-        job_type = clean_text(type_link)
+    # --- Dates --------------------------------------------------------------
+    # The meta row (near the type anchor) usually carries DD/MM/YYYY or a
+    # 'posted - closing' range. The Job Overview box may carry an explicit
+    # "Application Deadline".
+    date_posted = ""
+    deadline    = ""
 
-    location = DEFAULT_LOCATION
-    loc_links = soup.select('a[href*="/job-location/"]')
-    if loc_links:
-        loc_text = ", ".join(clean_text(l) for l in loc_links if clean_text(l))
-        # Drop the generic "The Gambia" country tag when a town is also present.
-        parts = [p.strip() for p in loc_text.split(",") if p.strip()]
-        specific = [p for p in parts if p.lower() != "the gambia"]
-        location = specific[0] if specific else (parts[0] if parts else DEFAULT_LOCATION)
+    meta_text = ""
+    type_a = soup.select_one('a[href*="/job-type/"]') or \
+             soup.select_one('a[href*="/job-location/"]')
+    if type_a:
+        node = type_a
+        for _ in range(4):
+            node = node.parent
+            if node is None:
+                break
+            txt = node.get_text(" ", strip=True)
+            if DMY_DATE_RE.search(txt):
+                meta_text = txt
+                break
+    meta_ds = dmy_dates(meta_text)
+    if len(meta_ds) >= 2:
+        date_posted, deadline = meta_ds[0], meta_ds[-1]
+    elif len(meta_ds) == 1:
+        deadline = meta_ds[0]
 
-    categories = []
-    for cat_link in soup.select('a[href*="/job-category/"]'):
-        cname = clean_text(cat_link)
-        if cname:
-            categories.append(cname)
-    job_field = categories[0] if categories else ""
-
-    overview = _gamjobs_parse_overview(soup)
-
-    # Deadline: prefer the explicit "Application Deadline" overview field,
-    # then the publish-expiry date range shown next to the job type/location.
-    deadline = ""
-    if overview.get("Application Deadline"):
-        deadline = parse_slash_date(overview["Application Deadline"]) or \
-                   parse_gambia_date(overview["Application Deadline"])
+    # Explicit deadline label anywhere on the page wins if present.
+    page_text_full = soup.get_text("\n")
+    for lab in DEADLINE_LABELS:
+        m = re.search(rf"{lab}\s*[:\-]?\s*([^\n<]+)", page_text_full, re.I)
+        if m:
+            d = parse_any_date(m.group(1))
+            if d:
+                deadline = d
+                break
+    if not date_posted:
+        date_posted = datetime.now().strftime("%Y-%m-%d")
     if not deadline:
-        header_block = soup.select_one("h1")
-        header_text = ""
-        if header_block:
-            following_siblings_text = clean_text(header_block.find_parent())
-            header_text = following_siblings_text or page_text[:400]
-        deadline = parse_slash_date(header_text) or parse_slash_date(page_text[:1000])
-    if not deadline:
-        deadline = (datetime.now() + timedelta(days=60)).strftime("%Y-%m-%d")
+        # Sensible fallback so WP expiry is populated.
+        deadline = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
 
-    salary = overview.get("Salary", "")
+    # --- Body: description + how-to-apply -----------------------------------
+    content_el = _find_content(soup)
+    # Work on a copy so we don't disturb the live tree for later lookups.
+    content_copy = BeautifulSoup(str(content_el), "lxml")
+    content_text = html_block_to_text(content_copy)
+    description, apply_text = _split_description_and_apply(content_text)
+    if not description:
+        description = content_text
 
-    # Main content: the body copy sits in the post/article content area.
-    content_el = (soup.select_one(".job_description, .single_job_listing, "
-                                   "article .entry-content, article")
-                  or soup.select_one("main"))
-    description = html_block_to_text(content_el) if content_el else page_text[:2000]
-    # Trim trailing site furniture that sometimes gets swept into a loose
-    # "article" selector (share links, related-jobs heading, etc.).
-    description = re.split(r"\n(?:Share:|Related Jobs|Apply for this job)\b",
-                           description, maxsplit=1)[0].strip()
-
-    qual_match = re.search(
-        r"Qualifications?\s*&?\s*Experience\s*\n(.+?)(?=\n\*\*|\n[A-Z][a-zA-Z ]{3,30}\n|\Z)",
+    # --- Qualifications block (best-effort, for the WP field) ---------------
+    qualifications = ""
+    qm = re.search(
+        r"(qualifications?(?:\s*&?\s*experience)?\s*:?\s*\n)(.*?)(?:\n[A-Z][^\n]{0,60}:|\n(?:how to apply|what we offer|to apply)\b|\Z)",
         description, re.I | re.S)
-    qualification = qual_match.group(1).strip() if qual_match else ""
-    experience = extract_experience(qualification or description)
+    if qm:
+        qualifications = qm.group(2).strip()[:1500]
+    experience = extract_experience(qualifications or description)
 
-    apply_url, apply_email = _gamjobs_extract_apply(soup, page_text)
-    logo = _gamjobs_extract_logo(soup)
+    # --- Apply target (email or external URL) -------------------------------
+    # Prefer anchors inside the apply tail; never use the on-page login button.
+    apply_email = ""
+    apply_url   = ""
+
+    # 1) anchors within the content body
+    for a in content_el.find_all("a", href=True):
+        href = a["href"].strip()
+        if href.lower().startswith("mailto:"):
+            apply_email = apply_email or extract_email(href[7:])
+        elif _is_real_apply_url(href):
+            apply_url = apply_url or strip_tracking_params(href)
+
+    # 2) plain-text fallbacks from the apply tail (or whole body)
+    scan = apply_text or description
+    if not apply_email:
+        apply_email = extract_email(scan)
+    if not apply_url:
+        for u in URL_PATTERN.findall(scan):
+            if _is_real_apply_url(u):
+                apply_url = strip_tracking_params(u.rstrip(".,);"))
+                break
+
+    salary = extract_salary(description)
 
     return {
-        "source":          "Gamjobs",
-        "title":           title,
-        "job_url":         job_url,
-        "company_name":    company_name,
-        "location":        location,
-        "qualification":   qualification,
-        "experience":      experience,
-        "salary":          salary,
-        "grade":           "",
-        "deadline":        deadline,
-        "description":     description,
-        "apply_url":       apply_url,
-        "apply_email":     apply_email,
-        "apply_text":      description[-500:],
-        "company_logo":    logo,
-        "company_website": company_url or GAMJOBS_WEBSITE,
-        "source_page":     job_url,
-        "job_type":        job_type,
+        "title":          title,
+        "company_name":   company_name,
+        "company_url":    company_url,
+        "company_website":company_website,
+        "company_address":company_address,
+        "company_logo":   logo,
+        "job_type":       job_type,
+        "location":       location,
+        "job_field":      job_field,
+        "date_posted":    date_posted,
+        "deadline":       deadline,
+        "description":    description,
+        "qualification":  qualifications,
+        "experience":     experience,
+        "salary":         salary,
+        "apply_email":    apply_email,
+        "apply_url":      apply_url,
+        "apply_text":     apply_text,
+        "job_url":        _norm_job_url(url),
     }
 
-def scrape_gamjobs_vacancies(already_processed_urls: set):
-    """Crawl Gamjobs pagination and parse every job/tender detail page found."""
-    links = gamjobs_collect_links(already_processed_urls)
-
-    jobs = []
-    for i, link in enumerate(links, start=1):
-        if link in already_processed_urls:
-            continue
-        log(f"  [{i}/{len(links)}] Fetching detail page: {link}")
-        job = scrape_gamjobs_detail(link)
-        if job:
-            jobs.append(job)
-        time.sleep(REQUEST_DELAY)
-
-    log(f"  Parsed {len(jobs)} new Gamjobs record(s).")
-    return jobs
-
 # =============================================================================
-#  STEP 2 — DEDUPLICATE + PARAPHRASE + APPLY-RULE GATING
+#  STEP 3 — DEDUPLICATE + PARAPHRASE + APPLY-RULE GATING
 # =============================================================================
 
 def process_job(raw_job: dict, processed_ids: set, processed_urls: set, seen_content: set):
@@ -1600,45 +1301,38 @@ def process_job(raw_job: dict, processed_ids: set, processed_urls: set, seen_con
     """
     job_url  = raw_job.get("job_url", "")
     title    = raw_job.get("title", "")
-    ministry = raw_job.get("company_name", "")
+    company  = raw_job.get("company_name", "")
     location = raw_job.get("location", "")
-    source   = raw_job.get("source", "Unknown")
 
-    job_id = make_job_id(job_url, title, ministry)
+    if not title:
+        return "duplicate", None  # nothing usable
+
+    job_id = make_job_id(job_url, title, company)
 
     if job_id in processed_ids or job_url in processed_urls:
         log(C_DIM(f"  Already processed (tracker) — skipped: {title}"))
         return "duplicate", None
 
-    fingerprint = (title.lower().strip(), ministry.lower().strip(), location.lower().strip())
+    fingerprint = (title.lower().strip(), company.lower().strip(), location.lower().strip())
     if fingerprint in seen_content:
         log(C_DIM(f"  Duplicate content this run — skipped: {title}"))
         return "duplicate", None
     seen_content.add(fingerprint)
 
     # ---- Public-apply rule -------------------------------------------------
-    # PSC: every posting shares the same login-only portal, gated by
-    # PSC_PORTAL_AS_APPLY. Gamjobs: each listing carries its own real public
-    # apply email/URL already, so it qualifies whenever either is present —
-    # no separate site-wide toggle needed.
     apply_email = raw_job.get("apply_email", "")
     apply_url   = raw_job.get("apply_url", "")
+    qualifies   = bool(apply_email) or bool(apply_url)
 
-    if source == "PSC Gambia":
-        qualifies = bool(apply_email) or (PSC_PORTAL_AS_APPLY and bool(apply_url))
-        non_qualify_reason = ("login-only e-recruitment portal; PSC_PORTAL_AS_APPLY is off"
-                              if apply_url else "no public apply email or URL")
-    else:
-        qualifies = bool(apply_email) or bool(apply_url)
-        non_qualify_reason = "no public apply email or URL found on listing"
-
-    if not qualifies:
-        write_flagged(raw_job, non_qualify_reason, raw_job.get("apply_text", "")[:300])
-        log(C_RED(f"  FLAGGED (non-qualifying apply) — {title}"))
+    if REQUIRE_PUBLIC_APPLY and not qualifies:
+        write_flagged(raw_job,
+                      "no public apply email or external URL (login-only on GamJobs)",
+                      raw_job.get("apply_text", "")[:300])
+        log(C_RED(f"  FLAGGED (no public apply) — {title}"))
         return "flagged", None
 
     # Record on scrape — before paraphrasing or posting.
-    mark_scraped(job_id, job_url, title, ministry)
+    mark_scraped(job_id, job_url, title, company)
     processed_ids.add(job_id)
     processed_urls.add(job_url)
 
@@ -1655,8 +1349,10 @@ def process_job(raw_job: dict, processed_ids: set, processed_urls: set, seen_con
         print(C_DIM("  Paraphrasing skipped (ENABLE_PARAPHRASE=False or MISTRAL_API_KEY not set)"))
 
     application = apply_email or apply_url
-    apply_method = ("portal_url" if apply_url and not apply_email
-                    else "description_email" if apply_email else "not_found")
+    apply_method = ("description_email" if apply_email
+                    else "external_url" if apply_url else "not_found")
+
+    company_link = raw_job.get("company_website") or raw_job.get("company_url", "")
 
     return "ok", {
         "jobTitle":          paraphrased_title,
@@ -1664,22 +1360,21 @@ def process_job(raw_job: dict, processed_ids: set, processed_urls: set, seen_con
         "companyDetails":    "",
         "originalTitle":     title,
         "originalDesc":      description,
-        "jobType":           raw_job.get("job_type", "") or "Full-time",
+        "jobType":           raw_job.get("job_type", "full-time"),
         "jobQualifications": raw_job.get("qualification", ""),
         "jobExperience":     raw_job.get("experience", ""),
         "jobLocation":       location,
-        "jobField":          ministry if source == "PSC Gambia" else raw_job.get("job_type", "") or ministry,
-        "datePosted":        datetime.now().strftime("%Y-%m-%d"),
+        "jobField":          raw_job.get("job_field", ""),
+        "datePosted":        raw_job.get("date_posted", datetime.now().strftime("%Y-%m-%d")),
         "deadline":          raw_job.get("deadline", ""),
         "application":       application,
-        "companyUrl":        raw_job.get("company_website", ""),
-        "companyName":       ministry,
+        "companyUrl":        company_link,
+        "companyName":       company,
         "companyLogo":       raw_job.get("company_logo", ""),
         "companyWebsite":    raw_job.get("company_website", ""),
-        "companyAddress":    location,
+        "companyAddress":    raw_job.get("company_address", "") or location,
         "jobUrl":            job_url,
         "salaryRange":       raw_job.get("salary", ""),
-        "_source":           source,
         "_jobId":            job_id,
         "_apply_method":     apply_method,
         "_apply_raw":        raw_job.get("apply_text", "")[:160],
@@ -1695,7 +1390,7 @@ def print_job_verbose(index, job):
 
     print()
     print(C_DIVIDER())
-    print(C_HEADER(f"  JOB #{index}  [{job.get('_source', '')}]"))
+    print(C_HEADER(f"  JOB #{index}"))
     print(C_DIVIDER())
     print(f"  {C_LABEL('Title (original)')}    : {C_VALUE(job.get('originalTitle',''))}")
     print(f"  {C_LABEL('Title (paraphrased)')} : {C_GREEN(job.get('jobTitle',''))}")
@@ -1703,7 +1398,7 @@ def print_job_verbose(index, job):
     print(f"  {C_LABEL('Qualification')}        : {(job.get('jobQualifications','')[:120] or C_DIM('—'))}")
     print(f"  {C_LABEL('Experience')}           : {job.get('jobExperience','') or C_DIM('—')}")
     print(f"  {C_LABEL('Location')}             : {job.get('jobLocation','') or C_DIM('—')}")
-    print(f"  {C_LABEL('Ministry/Field')}       : {job.get('jobField','') or C_DIM('—')}")
+    print(f"  {C_LABEL('Category/Field')}       : {job.get('jobField','') or C_DIM('—')}")
     print(f"  {C_LABEL('Salary')}               : {job.get('salaryRange','') or C_DIM('—')}")
     print(f"  {C_LABEL('Posted')}               : {job.get('datePosted','') or C_DIM('—')}")
     print(f"  {C_LABEL('Deadline')}             : {job.get('deadline','') or C_DIM('—')}")
@@ -1715,6 +1410,7 @@ def print_job_verbose(index, job):
     print()
     print(f"  {C_BLUE('── EMPLOYER ─────────────────────────────────────────')}")
     print(f"  {C_LABEL('Name')}      : {C_VALUE(job.get('companyName','') or C_DIM('—'))}")
+    print(f"  {C_LABEL('Website')}   : {job.get('companyWebsite','') or C_DIM('—')}")
     print(f"  {C_LABEL('Source')}    : {job.get('companyUrl','') or C_DIM('—')}")
     print(f"  {C_LABEL('Logo')}      : {job.get('companyLogo','') or C_DIM('— none —')}")
 
@@ -1729,7 +1425,7 @@ def print_job_verbose(index, job):
 # =============================================================================
 
 EXCEL_HEADERS = [
-    "Source", "Job Title", "Job Type", "Job Qualifications", "Job Experience",
+    "Job Title", "Job Type", "Job Qualifications", "Job Experience",
     "Job Location", "Job Field", "Date Posted", "Deadline",
     "Job Description", "Application", "Company URL", "Company Name",
     "Company Logo", "Company Website", "Company Address",
@@ -1748,10 +1444,10 @@ def _save_excel(jobs: list):
     ws.append(EXCEL_HEADERS)
     for job in jobs:
         ws.append([
-            job.get("_source", ""), job["jobTitle"], job["jobType"], job["jobQualifications"],
-            job["jobExperience"], job["jobLocation"], job["jobField"], job["datePosted"],
-            job["deadline"], job["jobDescription"], job["application"], job["companyUrl"],
-            job["companyName"], job["companyLogo"], job["companyWebsite"], job["companyAddress"],
+            job["jobTitle"], job["jobType"], job["jobQualifications"], job["jobExperience"],
+            job["jobLocation"], job["jobField"], job["datePosted"], job["deadline"],
+            job["jobDescription"], job["application"], job["companyUrl"], job["companyName"],
+            job["companyLogo"], job["companyWebsite"], job["companyAddress"],
             job["companyDetails"], job["jobUrl"], job["salaryRange"],
         ])
     wb.save(OUTPUT_FILE)
@@ -1766,44 +1462,38 @@ def main():
 
     print()
     print(C_HEADER("=" * 80))
-    print(C_HEADER("  GAMBIA JOBS SCRAPER (PSC + GAMJOBS) + MISTRAL PARAPHRASE + WP POSTING"))
+    print(C_HEADER("  GAMJOBS (GAMBIA) SCRAPER + MISTRAL PARAPHRASE + WORDPRESS POSTING"))
     print(C_HEADER("=" * 80))
-    print(f"  PSC source page  : {VACANCIES_URL}")
-    print(f"  PSC apply portal : {PSC_PORTAL_URL}")
-    print(f"  PSC portal=apply : {'✅ yes (jobs post)' if PSC_PORTAL_AS_APPLY else '❌ no (flag to CSV)'}")
-    print(f"  Gamjobs enabled  : {'✅ yes' if GAMJOBS_ENABLED else '❌ no'}")
-    if GAMJOBS_ENABLED:
-        print(f"  Gamjobs source   : {GAMJOBS_JOBS_URL}")
-        print(f"  Gamjobs max pages: {'unlimited (until no new jobs)' if not GAMJOBS_MAX_PAGES else GAMJOBS_MAX_PAGES}")
-    print(f"  Max new jobs     : {'unlimited' if not MAX_JOBS else MAX_JOBS}")
-    print(f"  Paraphrase       : {'✅ enabled' if (ENABLE_PARAPHRASE and MISTRAL_API_KEY) else '❌ disabled'}")
-    print(f"  WordPress post   : {'✅ enabled' if (WP_USER and WP_PASSWORD) else '❌ disabled'}")
-    print(f"  Excel export     : {'✅ enabled' if _XLSX_AVAILABLE else '❌ disabled (pip install pandas openpyxl)'}")
-    print(f"  NLP gating       : {'✅' if _NLP_AVAILABLE else '⚠️  no sentence-transformers / language-tool'}")
-    print(f"  Started          : {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  Gov gateway     : {GOV_GATEWAY_URL}")
+    print(f"  Jobs archive    : {JOBS_URL}")
+    print(f"  Public-apply    : {'✅ enforced (flag others)' if REQUIRE_PUBLIC_APPLY else '❌ off (post all)'}")
+    print(f"  Max new jobs    : {'unlimited' if not MAX_JOBS else MAX_JOBS}")
+    print(f"  Max pages       : {MAX_PAGES}")
+    print(f"  Paraphrase      : {'✅ enabled' if (ENABLE_PARAPHRASE and MISTRAL_API_KEY) else '❌ disabled'}")
+    print(f"  WordPress post  : {'✅ enabled' if (WP_USER and WP_PASSWORD) else '❌ disabled'}")
+    print(f"  Excel export    : {'✅ enabled' if _XLSX_AVAILABLE else '❌ disabled (pip install pandas openpyxl)'}")
+    print(f"  NLP gating      : {'✅' if _NLP_AVAILABLE else '⚠️  no sentence-transformers / language-tool'}")
+    print(f"  Started         : {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(C_HEADER("=" * 80))
 
     _init_tracker()
     _init_flagged()
     processed_ids, processed_urls = load_processed_ids()
-    print(f"  Tracker loaded: {len(processed_ids)} previously processed job IDs\n")
+    print(f"  Tracker loaded: {len(processed_ids)} previously processed job IDs")
 
-    raw_jobs = []
+    # Step 0: consult the official gov gateway, then collect links from GamJobs.
+    jobs_url = resolve_gov_gateway()
 
     try:
-        raw_jobs.extend(scrape_psc_vacancies())
+        job_links = collect_job_links(jobs_url)
     except Exception as e:
-        log(C_RED(f"  ERROR scraping PSC vacancies page: {e}"))
-
-    if GAMJOBS_ENABLED:
-        try:
-            raw_jobs.extend(scrape_gamjobs_vacancies(processed_urls))
-        except Exception as e:
-            log(C_RED(f"  ERROR scraping Gamjobs: {e}"))
-
-    if not raw_jobs:
-        log(C_RED("  FATAL: no vacancies parsed from any source."))
+        log(C_RED(f"  FATAL: could not collect job links: {e}"))
         return
+
+    if not job_links:
+        log(C_RED("  No job links found — nothing to do."))
+        return
+    print(C_GREEN(f"\n  Found {len(job_links)} job detail page(s) to process.\n"))
 
     jobs_out = []
     seen_content = set()
@@ -1811,25 +1501,39 @@ def main():
     flagged_count = 0
     dup_count = 0
     errors = 0
-    source_counts = {}
+    scraped = 0
 
-    for raw_job in raw_jobs:
+    for link in job_links:
+        # Skip detail fetch entirely if URL already processed.
+        if link in processed_urls:
+            dup_count += 1
+            log(C_DIM(f"  Already processed (tracker) — skipped: {link}"))
+            continue
+
+        try:
+            raw_job = scrape_job_detail(link)
+            scraped += 1
+        except Exception as e:
+            errors += 1
+            log(C_RED(f"  ERROR scraping {link} : {e}"))
+            time.sleep(REQUEST_DELAY)
+            continue
+
         try:
             status, job = process_job(raw_job, processed_ids, processed_urls, seen_content)
         except Exception as e:
             errors += 1
-            log(C_RED(f"  ERROR processing job '{raw_job.get('title','')}' : {e}"))
+            log(C_RED(f"  ERROR processing '{raw_job.get('title','')}' : {e}"))
             continue
 
         if status == "duplicate":
             dup_count += 1
+            time.sleep(REQUEST_DELAY)
             continue
         if status == "flagged":
             flagged_count += 1
+            time.sleep(REQUEST_DELAY)
             continue
-
-        src = job.get("_source", "Unknown")
-        source_counts[src] = source_counts.get(src, 0) + 1
 
         jobs_out.append(job)
         print_job_verbose(len(jobs_out), job)
@@ -1861,9 +1565,8 @@ def main():
     print(C_HEADER("=" * 80))
     print(C_HEADER("  SCRAPE COMPLETE"))
     print(C_HEADER("=" * 80))
-    print(f"  {C_LABEL('Vacancies parsed (all sources)')} : {len(raw_jobs)}")
-    for src, cnt in source_counts.items():
-        print(f"  {C_LABEL('  -> ' + src)}{'':<{max(1, 20-len(src))}} : {cnt}")
+    print(f"  {C_LABEL('Job links found')}           : {len(job_links)}")
+    print(f"  {C_LABEL('Detail pages scraped')}      : {scraped}")
     print(f"  {C_LABEL('New jobs processed')}        : {C_GREEN(str(len(jobs_out)))}")
     print(f"  {C_LABEL('Posted to WordPress')}       : {C_GREEN(str(posted_count))}")
     print(f"  {C_LABEL('Flagged (no public apply)')} : {flagged_count}")
@@ -1879,14 +1582,11 @@ def main():
         with_email = sum(1 for j in jobs_out if "@" in (j.get("application") or ""))
         with_url   = with_apply - with_email
         print(f"\n  {C_LABEL('Application links:')}")
-        print(f"    URL          : {with_url}")
+        print(f"    External URL : {with_url}")
         print(f"    Email found  : {with_email}")
 
         para_count = sum(1 for j in jobs_out if j.get("jobTitle") != j.get("originalTitle"))
         print(f"\n  {C_LABEL('Paraphrased titles')} : {para_count}/{len(jobs_out)}")
-
-        with_salary = sum(1 for j in jobs_out if j.get("salaryRange"))
-        print(f"  {C_LABEL('Salary captured')}    : {with_salary}/{len(jobs_out)}")
 
         with_deadline = sum(1 for j in jobs_out if j.get("deadline"))
         print(f"  {C_LABEL('Deadline captured')}  : {with_deadline}/{len(jobs_out)}")
