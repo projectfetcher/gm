@@ -162,6 +162,16 @@ _NON_APPLY_PATH_SUBSTR = (
     "/member-2", "action=login", "mode=register", "#share", "/share",
     "/wp-login", "/cart", "/checkout",
 )
+# Emails belonging to the board itself are never a real apply address — these
+# appear in the topbar/footer ("info@gamjobs.com") and must not be posted as the
+# place to apply.
+_NON_APPLY_EMAIL_DOMAINS = ("gamjobs.com",)
+
+def _is_real_apply_email(email: str) -> bool:
+    if not email or "@" not in email:
+        return False
+    dom = email.rsplit("@", 1)[-1].lower()
+    return not any(dom == d or dom.endswith("." + d) for d in _NON_APPLY_EMAIL_DOMAINS)
 
 # =============================================================================
 #  LOGGING / COLOUR
@@ -213,13 +223,16 @@ DMY_DATE_RE = re.compile(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b")
 DEADLINE_LABELS = ("application deadline", "closing date", "deadline",
                    "expiry date", "expires")
 
-# Body headings that introduce the application instructions. Anchored (^) and
-# used against a *stripped, short* line so it never trips on "Application
-# Deadline:" / "Application Format" inside the Job Overview box.
-APPLY_HEADING_RE = re.compile(
-    r"^(how\s*to\s*apply|to\s*apply|mode\s*of\s*application|method\s*of\s*application|"
+# Body headings that introduce the application instructions. Matched against a
+# *stripped, short* line (see _is_apply_heading_line) so it never trips on
+# 'Application Deadline:' / 'Application Format' or a mid-sentence 'to apply'.
+_APPLY_HEAD_PHRASES = re.compile(
+    r"^(?:how\s*(?:and|&)\s*deadline\s*to\s*apply|how\s*to\s*apply(?:\s*(?:and|&)\s*deadline)?|"
+    r"how\s*to\s*submit|to\s*apply|application\s*(?:and|&)\s*deadline|"
+    r"mode\s*of\s*application|method\s*of\s*application|"
     r"application\s*(?:procedure|process|instructions?|method|guidelines?)|"
-    r"submission\s*of\s*applications?|how\s*to\s*submit)\b", re.I
+    r"submission\s*of\s*applications?|deadline\s*(?:and|&)?\s*(?:how\s*)?to\s*apply)\b",
+    re.I,
 )
 
 # Boilerplate that marks the end of usable post content on a detail page.
@@ -1053,10 +1066,19 @@ def collect_job_links(jobs_url: str, max_pages: int = MAX_PAGES) -> list:
 #  STEP 2 — PARSE ONE GAMJOBS DETAIL PAGE
 # =============================================================================
 
+# Order matters: the FIRST highly-specific selectors target JobMonster's real
+# job body (`<div class="map-style-2" itemprop="description">`). Only if those
+# miss do we fall back to generic WP content containers — and the <body> fallback
+# is a last resort that would drag in site chrome (topbar/footer), so it is gated
+# behind a "looks like a real post body" check below.
 _CONTENT_SELECTORS = [
-    "div.job-description", "div.single-job-description", "div.noo-job-content",
-    "div.job-content", "div.job_description", "article .entry-content",
-    "div.entry-content", "main .entry-content", "div.page-content",
+    'div.map-style-2[itemprop="description"]',   # JobMonster job body (exact)
+    'div[itemprop="description"]',               # JobMonster job body (generic)
+    "div.map-style-2",
+    "div.single-job-content", "div.job-description", "div.single-job-description",
+    "div.noo-job-content", "div.job-content", "div.job_description",
+    "article .entry-content", "div.entry-content", "main .entry-content",
+    "div.page-content",
 ]
 
 def _find_content(soup):
@@ -1068,12 +1090,18 @@ def _find_content(soup):
             txt = el.get_text(" ", strip=True)
             if len(txt) > best_len:
                 best, best_len = el, len(txt)
-        if best and best_len > 400:
+        if best and best_len > 300:
             return best
     if best:
         return best
-    # Last resort: <article>, then <main>, then <body>.
-    return soup.find("article") or soup.find("main") or soup.body or soup
+    # Last resort: a single related-job <article> or <main>. Deliberately NOT the
+    # whole <body> — returning <body> is what dragged the topbar/footer (Hotline,
+    # Login, Navigation, footer email) into the description and made the site's
+    # own info@gamjobs.com look like an apply address.
+    main = soup.select_one("div.noo-main") or soup.find("main")
+    if main:
+        return main
+    return soup.find("article") or soup.body or soup
 
 def _anchors_in(scope, needle):
     out = []
@@ -1098,10 +1126,24 @@ def _is_real_apply_url(href: str) -> bool:
         return False
     return True
 
+def _is_apply_heading_line(line: str) -> bool:
+    """
+    True only for a SHORT standalone line that introduces the application
+    instructions, e.g. 'How to Apply', 'HOW AND DEADLINE TO APPLY',
+    'Mode of Application', 'Application Procedure'. The length guard stops it
+    matching a mid-sentence 'to apply' inside a normal paragraph.
+    """
+    s = line.strip().lstrip("•*-–—#:. ").strip()
+    if not s or len(s.split()) > 9:
+        return False
+    return bool(_APPLY_HEAD_PHRASES.match(s))
+
 def _split_description_and_apply(content_text: str):
     """
-    Given the cleaned body text, trim trailing boilerplate and split off the
-    'How to Apply' tail. Returns (description, apply_text).
+    Given the cleaned body text, drop trailing boilerplate / UI lines and split
+    off the 'How to Apply' tail. Returns (description, apply_text). The apply
+    tail (which holds the apply email/URL and the deadline sentence) is removed
+    from the description so the posted body is just the job content.
     """
     if not content_text:
         return "", ""
@@ -1115,17 +1157,21 @@ def _split_description_and_apply(content_text: str):
         if any(low.startswith(m) for m in _BODY_CUT_MARKERS):
             break
         kept.append(ln)
-    body = "\n".join(kept).strip()
 
-    # Find the apply heading and split there.
-    apply_text = ""
-    description = body
-    m = APPLY_HEADING_RE.search(body)
-    if m:
-        # Keep a little context: description is everything before the heading line.
-        head_start = body.rfind("\n", 0, m.start()) + 1
-        description = body[:head_start].strip() or body[:m.start()].strip()
-        apply_text = body[m.start():].strip()
+    # First line that is an apply heading marks the description/apply boundary.
+    apply_idx = None
+    for i, ln in enumerate(kept):
+        if _is_apply_heading_line(ln):
+            apply_idx = i
+            break
+
+    if apply_idx is None:
+        return "\n".join(kept).strip(), ""
+
+    description = "\n".join(kept[:apply_idx]).strip()
+    apply_text  = "\n".join(kept[apply_idx:]).strip()
+    if not description:                 # heading was the very first line — keep all
+        return "\n".join(kept).strip(), ""
     return description, apply_text
 
 def scrape_job_detail(url: str) -> dict:
@@ -1233,12 +1279,18 @@ def scrape_job_detail(url: str) -> dict:
         description = content_text
 
     # --- Qualifications block (best-effort, for the WP field) ---------------
+    # Heading forms seen on GamJobs: "Qualifications", "Qualifications & Experience",
+    # "QUALIFICATIONS REQUIRED", "Qualification(s) and Experience".
     qualifications = ""
     qm = re.search(
-        r"(qualifications?(?:\s*&?\s*experience)?\s*:?\s*\n)(.*?)(?:\n[A-Z][^\n]{0,60}:|\n(?:how to apply|what we offer|to apply)\b|\Z)",
+        r"(?:^|\n)[ \t]*qualifications?(?:\s*(?:&|and)\s*experience)?(?:\s+\w+){0,3}\s*:?[ \t]*\n"
+        r"(.*?)"
+        r"(?:\n[ \t]*(?:how\s*(?:and|&)?\s*(?:deadline\s*)?to\s*apply|what\s+we\s+offer|"
+        r"key\s+competenc|duration\s+of|method\s+of\s+application|mode\s+of\s+application)\b"
+        r"|\n[ \t]*[A-Z][^\n]{0,60}:[ \t]*\n|\Z)",
         description, re.I | re.S)
     if qm:
-        qualifications = qm.group(2).strip()[:1500]
+        qualifications = qm.group(1).strip()[:1500]
     experience = extract_experience(qualifications or description)
 
     # --- Apply target (email or external URL) -------------------------------
@@ -1250,14 +1302,18 @@ def scrape_job_detail(url: str) -> dict:
     for a in content_el.find_all("a", href=True):
         href = a["href"].strip()
         if href.lower().startswith("mailto:"):
-            apply_email = apply_email or extract_email(href[7:])
+            cand = extract_email(href[7:])
+            if cand and _is_real_apply_email(cand):
+                apply_email = apply_email or cand
         elif _is_real_apply_url(href):
             apply_url = apply_url or strip_tracking_params(href)
 
     # 2) plain-text fallbacks from the apply tail (or whole body)
     scan = apply_text or description
     if not apply_email:
-        apply_email = extract_email(scan)
+        cand = extract_email(scan)
+        if cand and _is_real_apply_email(cand):
+            apply_email = cand
     if not apply_url:
         for u in URL_PATTERN.findall(scan):
             if _is_real_apply_url(u):
