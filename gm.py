@@ -430,6 +430,279 @@ def extract_salary(text: str) -> str:
     return ""
 
 # =============================================================================
+#  CANONICAL NORMALISERS  (shared schema — qualification tier / experience band /
+#  job field). These mirror the mappings used across the other country pipelines
+#  so GamJobs rows land in the same shape: a TIER label for qualification, a BAND
+#  label for experience, and a single canonical FIELD rather than the site's raw
+#  multi-category tag dump.
+# =============================================================================
+
+# Keyword matcher shared by the tier/field maps. Short or ambiguous tokens (<=3
+# chars, e.g. "pa", "hr", "ma", "qa", "0 years") must match as whole words so they
+# don't fire inside longer words ("diploma", "patrol", "40 years"); longer tokens
+# keep prefix behaviour so "developer" still catches "developers".
+def _kw_hit(text_low: str, keywords) -> bool:
+    for k in keywords:
+        kk = k.strip().lower()
+        if not kk:
+            continue
+        esc = re.escape(kk)
+        if len(kk) <= 3:
+            # acronyms/codes -> exact whole token
+            pat = r"(?<![a-z0-9])" + esc + r"(?![a-z0-9])"
+        else:
+            # whole token, tolerating a plural 's'/'es' (developer->developers)
+            # but NOT an arbitrary suffix (quota !-> quotation, ma !-> diploma)
+            pat = r"(?<![a-z0-9])" + esc + r"(?:es|s)?(?![a-z0-9])"
+        if re.search(pat, text_low):
+            return True
+    return False
+
+# --- Qualification: text -> single tier label -------------------------------
+QUALIFICATION_TIERS = [
+    ("PhD / Doctorate",          ["phd", "ph.d", "doctorate", "doctoral", "doctor of philosophy"]),
+    ("Master's Degree",          ["master", "msc", "m.sc", "ma ", "m.a ", "mba", "m.b.a", "meng",
+                                  "m.eng", "mphil", "postgraduate", "post-graduate", "post graduate"]),
+    ("Bachelor's Degree",        ["bachelor", "bsc", "b.sc", "ba ", "b.a ", "beng", "b.eng", "bcom",
+                                  "b.com", "bba", "llb", "degree in", "undergraduate degree",
+                                  "honours degree", "hons"]),
+    ("Higher National Diploma",  ["hnd", "hnc", "higher national diploma", "higher national certificate",
+                                  "higher diploma", "advanced diploma"]),
+    ("Diploma",                  ["diploma", "dip ", "dip.", "associate degree", "foundation degree"]),
+    ("Professional Certification", ["acca", "cpa", "cfa", "cima", "pmp", "prince2", "cissp",
+                                    "aws certified", "comptia", "cisco", "ccna", "ccnp", "shrm",
+                                    "cipd", "chartered", "certified public", "certified financial",
+                                    "certified project", "professional certification",
+                                    "professional certificate"]),
+    ("A-Levels / HSC",           ["a-level", "a level", "hsc", "higher school certificate", "ib diploma",
+                                  "international baccalaureate", "gce advanced"]),
+    ("O-Levels / School Certificate", ["o-level", "o level", "igcse", "gcse", "school certificate",
+                                       "sc ", "cpe", "certificate of primary"]),
+    ("No Formal Qualification Required", ["no qualification", "no degree", "no formal", "school leaver",
+                                          "entry level", "no experience required", "training provided",
+                                          "will train"]),
+]
+
+def extract_qualification(text: str) -> str:
+    if not text:
+        return ""
+    # Skip school-admission notices that merely mention pupils' ages/levels.
+    if re.search(r"nursery|primary years|ib pyp|aged between|boys and girls", text, re.I):
+        return ""
+    lower = text.lower()
+    for label, keywords in QUALIFICATION_TIERS:
+        if _kw_hit(lower, keywords):
+            return label
+    return ""
+
+# --- Experience: text -> single band label ----------------------------------
+NO_EXP_KW = ["no experience", "no prior experience", "fresh graduate", "freshers",
+             "entry level", "entry-level", "0 years", "zero experience",
+             "training provided", "will train", "no experience required"]
+LESS1_KW  = ["less than 1 year", "under 1 year", "6 months", "less than a year",
+             "some experience", "minimal experience"]
+
+def years_to_band(n: int) -> str:
+    if n <= 0:  return "No Experience Required"
+    if n <= 2:  return "1 - 2 Years"
+    if n <= 5:  return "3 - 5 Years"
+    if n <= 10: return "6 - 10 Years"
+    return "10+ Years"
+
+# Only treat a number as a *requirement* when it sits in an experience context,
+# so org-history phrasing ("established 40 years ago", "since 1982") is ignored.
+# A real job requirement is also capped at a sane ceiling.
+_EXP_CAP = 20
+_EXP_REQ_RE = re.compile(
+    r"(?:minimum|min\.?|at\s+least|atleast|least|over|more\s+than|not\s+less\s+than|"
+    r"minimum\s+of|a\s+minimum\s+of)\s+(?:of\s+)?(\d{1,2})\s*\+?\s*years?", re.I)
+# "N years of <work/experience/…>" is itself a tenure requirement, even without a
+# 'minimum' prefix and even when 'experience' is far away in the sentence.
+_EXP_YEARS_OF_RE = re.compile(r"(\d{1,2})\s*\+?\s*years?\s+of\b", re.I)
+_EXP_ANY_YEARS_RE = re.compile(r"(\d{1,2})\s*\+?\s*years?", re.I)
+_EXP_RANGE_RE = re.compile(r"(\d{1,2})\s*(?:-|–|to)\s*(\d{1,2})\s*years?", re.I)
+
+def extract_experience_band(text: str) -> str:
+    """Map free text to one of the canonical experience bands (or '')."""
+    if not text:
+        return ""
+    low = text.lower()
+    years = []
+    # (a) explicit requirement phrasing: "minimum 3 years", "at least 5 years"
+    for m in _EXP_REQ_RE.finditer(text):
+        n = int(m.group(1))
+        if 0 < n <= _EXP_CAP:
+            years.append(n)
+    # (b) "N years of ..." tenure construction (capped, so org-history "40 years
+    #     of experience" is filtered out by _EXP_CAP).
+    for m in _EXP_YEARS_OF_RE.finditer(low):
+        n = int(m.group(1))
+        if 0 < n <= _EXP_CAP:
+            years.append(n)
+    # (c) "N years ... experience" with 'experience' near the figure
+    for m in _EXP_ANY_YEARS_RE.finditer(low):
+        n = int(m.group(1))
+        if 0 < n <= _EXP_CAP and "experien" in low[m.end():m.end() + 60]:
+            years.append(n)
+    # (d) ranges: "3-5 years", "3 to 5 years"
+    for m in _EXP_RANGE_RE.finditer(text):
+        a = int(m.group(1))
+        if 0 < a <= _EXP_CAP:
+            years.append(a)
+    if years:
+        return years_to_band(min(years))           # explicit figure wins
+    if _kw_hit(low, NO_EXP_KW):
+        return "No Experience Required"
+    if _kw_hit(low, LESS1_KW):
+        return "1 - 2 Years"                       # floor band (no sub-1yr bucket)
+    return ""
+
+# --- Job field: title+description -> single canonical field -----------------
+# (field, strong keywords, weak keywords). Strong matches win over weak; the
+# list order is the tie-break priority.
+FIELD_KEYWORD_MAP = [
+    ("Information Technology",
+     ["software engineer", "developer", "devops", "frontend", "backend", "full stack", "fullstack",
+      "sysadmin", "cloud", "cybersecurity", "data engineer", "machine learning", "artificial intelligence",
+      "ai/ml", "it support", "network engineer", "database", "kubernetes", "docker", "aws", "azure",
+      "react", "node.js", "python developer", "java developer"],
+     ["programming", "coding", "api", "agile", "scrum", "git", "linux", "server", "infrastructure", "software"]),
+    ("Finance & Accounting",
+     ["accountant", "auditor", "finance manager", "financial analyst", "cfo", "treasurer", "tax",
+      "bookkeeper", "payroll", "budget analyst", "credit analyst", "investment", "portfolio manager",
+      "risk analyst", "forex", "actuary", "acca", "cfa", "cpa"],
+     ["financial", "accounting", "balance sheet", "p&l", "reconciliation", "ifrs", "gaap", "ledger", "invoicing"]),
+    ("Sales & Business Development",
+     ["sales executive", "sales manager", "business development", "account manager",
+      "sales representative", "bd manager", "regional sales", "key account", "sales director",
+      "commercial manager", "sales officer"],
+     ["revenue", "pipeline", "crm", "leads", "prospects", "quota", "target", "upsell", "cross-sell", "b2b", "b2c"]),
+    ("Marketing & Communications",
+     ["marketing manager", "digital marketing", "seo", "sem", "content marketer", "social media manager",
+      "brand manager", "marketing executive", "communications manager", "pr manager", "copywriter",
+      "growth hacker", "email marketing", "campaign manager"],
+     ["marketing", "branding", "advertising", "social media", "content", "campaign", "analytics",
+      "google ads", "facebook ads", "influencer"]),
+    ("Human Resources",
+     ["hr manager", "human resources", "recruiter", "talent acquisition", "hr business partner",
+      "hrbp", "hr officer", "compensation", "benefits manager", "organisational development",
+      "learning and development", "l&d", "hr generalist", "payroll manager"],
+     ["recruitment", "onboarding", "performance management", "employee relations", "hr", "workforce"]),
+    ("Engineering",
+     ["mechanical engineer", "civil engineer", "electrical engineer", "structural engineer",
+      "process engineer", "project engineer", "maintenance engineer", "production engineer",
+      "quality engineer", "safety engineer", "site engineer", "design engineer"],
+     ["engineering", "cad", "autocad", "solidworks", "manufacturing", "plant", "machinery", "commissioning"]),
+    ("Healthcare & Medicine",
+     ["doctor", "physician", "nurse", "pharmacist", "medical officer", "surgeon", "anaesthetist",
+      "physiotherapist", "radiographer", "lab technician", "clinical", "healthcare manager",
+      "occupational therapist", "dentist", "midwife"],
+     ["hospital", "clinic", "patient", "medical", "health", "pharmaceutical", "diagnosis", "treatment"]),
+    ("Education & Training",
+     ["teacher", "lecturer", "professor", "trainer", "educator", "tutor", "school principal",
+      "academic", "curriculum", "e-learning", "instructional designer", "teaching assistant"],
+     ["school", "university", "college", "classroom", "students", "pedagogy", "curriculum", "education"]),
+    ("Hospitality & Tourism",
+     ["hotel manager", "front desk", "housekeeping", "chef", "sous chef", "food and beverage",
+      "f&b manager", "restaurant manager", "bartender", "waiter", "concierge", "tour guide",
+      "travel agent", "events coordinator", "catering"],
+     ["hospitality", "hotel", "resort", "tourism", "guest", "accommodation", "restaurant", "kitchen"]),
+    ("Logistics & Supply Chain",
+     ["supply chain manager", "logistics coordinator", "warehouse manager", "fleet manager",
+      "procurement manager", "purchasing manager", "import export", "freight", "shipping coordinator",
+      "inventory manager", "demand planner"],
+     ["logistics", "supply chain", "warehouse", "inventory", "freight", "procurement", "sourcing"]),
+    ("Legal",
+     ["lawyer", "attorney", "legal counsel", "paralegal", "compliance officer", "legal advisor",
+      "solicitor", "barrister", "corporate counsel", "legal manager", "contract manager"],
+     ["legal", "law", "contracts", "litigation", "regulatory", "compliance", "gdpr"]),
+    ("Administration & Operations",
+     ["office manager", "executive assistant", "administrative officer", "operations manager",
+      "pa", "personal assistant", "receptionist", "data entry", "office administrator",
+      "company secretary", "business analyst"],
+     ["administration", "operations", "office", "coordination", "scheduling", "reporting", "clerical"]),
+    ("Customer Service",
+     ["customer service", "call centre", "customer success", "customer support", "help desk",
+      "service advisor", "client relations", "customer experience", "contact centre"],
+     ["customer", "support", "helpdesk", "tickets", "escalation", "satisfaction", "service level"]),
+    ("Construction & Real Estate",
+     ["quantity surveyor", "site supervisor", "project manager construction", "architect",
+      "draughtsman", "property manager", "estate agent", "real estate", "building inspector",
+      "land surveyor", "construction manager"],
+     ["construction", "building", "property", "real estate", "site", "contractor", "tender"]),
+    ("Manufacturing & Production",
+     ["production manager", "quality control", "quality assurance", "qa", "qc", "factory manager",
+      "plant manager", "production supervisor", "assembly", "cnc operator", "technician"],
+     ["production", "manufacturing", "factory", "assembly", "quality", "lean", "six sigma"]),
+    ("Design & Creative",
+     ["graphic designer", "ui/ux", "product designer", "art director", "creative director",
+      "animator", "illustrator", "photographer", "videographer", "motion designer", "web designer"],
+     ["design", "creative", "adobe", "figma", "photoshop", "illustrator", "indesign", "sketch", "branding"]),
+    ("Research & Science",
+     ["research scientist", "data scientist", "lab researcher", "research analyst",
+      "clinical researcher", "environmental scientist", "chemist", "biologist", "statistician"],
+     ["research", "analysis", "data", "laboratory", "science", "experiment", "findings", "methodology"]),
+    ("Security",
+     ["security officer", "security guard", "security manager", "cctv", "loss prevention",
+      "risk manager", "health and safety", "hse officer", "osh", "fire safety"],
+     ["security", "safety", "risk", "surveillance", "patrol", "access control", "emergency"]),
+    ("Media & Journalism",
+     ["journalist", "editor", "reporter", "broadcast", "news anchor", "content creator",
+      "media manager", "radio", "television", "producer", "scriptwriter"],
+     ["media", "journalism", "broadcast", "news", "editorial", "publishing", "press"]),
+    ("Non-Profit & Social Work",
+     ["social worker", "ngo", "charity", "programme coordinator", "community development",
+      "welfare officer", "case manager", "development officer", "fundraiser", "volunteer coordinator"],
+     ["social", "ngo", "community", "welfare", "beneficiary", "donor", "impact", "charity"]),
+]
+
+# Procurement / notice markers in a title. Conservative: clear acronyms as whole
+# tokens plus unambiguous phrases. Deliberately does NOT match a bare "call for
+# applications" (often a volunteer/role advert, not a tender).
+_TENDER_TITLE_RE = re.compile(
+    r"\b(?:rfq|rfp|reoi|eoi|itb|itt|spn|rfb|rfa|gpn|ifb|rfi)\b"
+    r"|invitation\s+to\s+(?:bid|tender)|invitation\s+for\s+bids?"
+    r"|request\s+for\s+(?:quotation|proposal|proposals|expression|expressions|bids?)"
+    r"|expressions?\s+of\s+interest"
+    r"|\btenders?\b|procurement\s+notice|specific\s+procurement|general\s+procurement"
+    r"|call\s+for\s+(?:bid|bids|tender|tenders|proposal|proposals|expression|expressions|quotation)"
+    r"|matching\s+grant|terms\s+of\s+reference|prior\s+notice\s+of\s+procurement",
+    re.I,
+)
+TENDER_FIELD = "Public Notices & Tenders"
+
+def infer_field(title: str, description: str, fallback_categories: str = "") -> str:
+    """
+    Resolve a single canonical job field from the title + description. Procurement
+    notices (the bulk of the GamJobs feed) are detected first and routed to
+    "Public Notices & Tenders" — otherwise incidental keyword hits mislabel them
+    (e.g. the word "tender" lives in Construction's weak list, and an SPN for a
+    "Digital Marketing Campaign" would land in Marketing). After that, strong
+    keywords win over weak (list order = tie-break). If nothing matches, fall back
+    to the site's own category so the field is never empty.
+    """
+    title_l = (title or "").lower()
+    if _TENDER_TITLE_RE.search(title_l):
+        return TENDER_FIELD
+
+    text = f"{title}\n{description}".lower()
+    for field, strong, _weak in FIELD_KEYWORD_MAP:
+        if _kw_hit(text, strong):
+            return field
+    for field, _strong, weak in FIELD_KEYWORD_MAP:
+        if _kw_hit(text, weak):
+            return field
+    if fallback_categories:
+        cats = [c.strip() for c in fallback_categories.split(",") if c.strip()]
+        # Prefer the site's tender/notice category if it tagged one.
+        for c in cats:
+            if "tender" in c.lower() or "notice" in c.lower():
+                return TENDER_FIELD
+        if cats:
+            return cats[0]
+    return ""
+
+# =============================================================================
 #  NLP TOOLS (lazy init, optional)
 # =============================================================================
 
@@ -1226,7 +1499,8 @@ def scrape_job_detail(url: str) -> dict:
 
     job_type = map_job_type(job_type_opts[0]) if job_type_opts else "full-time"
     location = pick_location(location_opts)
-    job_field = ", ".join(dict.fromkeys(category_opts)) if category_opts else ""
+    # Site's own multi-category tags (kept as the fallback for infer_field below).
+    job_field_raw = ", ".join(dict.fromkeys(category_opts)) if category_opts else ""
 
     # --- Dates --------------------------------------------------------------
     # The meta row (near the type anchor) usually carries DD/MM/YYYY or a
@@ -1278,10 +1552,10 @@ def scrape_job_detail(url: str) -> dict:
     if not description:
         description = content_text
 
-    # --- Qualifications block (best-effort, for the WP field) ---------------
+    # --- Qualification + experience (normalised to schema tier/band) --------
     # Heading forms seen on GamJobs: "Qualifications", "Qualifications & Experience",
     # "QUALIFICATIONS REQUIRED", "Qualification(s) and Experience".
-    qualifications = ""
+    qual_block = ""
     qm = re.search(
         r"(?:^|\n)[ \t]*qualifications?(?:\s*(?:&|and)\s*experience)?(?:\s+\w+){0,3}\s*:?[ \t]*\n"
         r"(.*?)"
@@ -1290,8 +1564,13 @@ def scrape_job_detail(url: str) -> dict:
         r"|\n[ \t]*[A-Z][^\n]{0,60}:[ \t]*\n|\Z)",
         description, re.I | re.S)
     if qm:
-        qualifications = qm.group(1).strip()[:1500]
-    experience = extract_experience(qualifications or description)
+        qual_block = qm.group(1).strip()[:1500]
+    # Tier label (e.g. "Bachelor's Degree") and band label (e.g. "3 - 5 Years").
+    qualification = extract_qualification(qual_block or description)
+    experience    = extract_experience_band(qual_block or description)
+
+    # --- Job field (single canonical field, GamJobs category as fallback) ---
+    job_field = infer_field(title, description, job_field_raw)
 
     # --- Apply target (email or external URL) -------------------------------
     # Prefer anchors inside the apply tail; never use the on-page login button.
@@ -1332,10 +1611,11 @@ def scrape_job_detail(url: str) -> dict:
         "job_type":       job_type,
         "location":       location,
         "job_field":      job_field,
+        "job_categories": job_field_raw,
         "date_posted":    date_posted,
         "deadline":       deadline,
         "description":    description,
-        "qualification":  qualifications,
+        "qualification":  qualification,
         "experience":     experience,
         "salary":         salary,
         "apply_email":    apply_email,
