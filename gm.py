@@ -98,6 +98,7 @@ _FLAGGED_FIELDS = ["Source", "Title", "Company", "Location", "Salary",
 WP_URL      = os.environ.get("WP_BASE_URL", "")
 WP_USER     = os.environ.get("WP_USERNAME", "")
 WP_PASSWORD = os.environ.get("WP_APP_PASSWORD", "")
+INTERNAL_BOT_KEY = os.environ.get("INTERNAL_BOT_KEY", "")
 WP_BASE      = WP_URL.rstrip("/")
 WP_JOBS_URL  = f"{WP_BASE}/job-listings"
 WP_MEDIA_URL = f"{WP_BASE}/media"
@@ -1091,7 +1092,10 @@ def write_flagged(raw_job: dict, reason: str, apply_note: str):
 
 def _wp_auth_headers() -> dict:
     token = base64.b64encode(f"{WP_USER}:{WP_PASSWORD}".encode()).decode()
-    return {"Authorization": f"Basic {token}", "Content-Type": "application/json"}
+    h = {"Authorization": f"Basic {token}", "Content-Type": "application/json"}
+    if INTERNAL_BOT_KEY:
+        h["X-Internal-Auth"] = INTERNAL_BOT_KEY
+    return h
 
 def get_or_create_term(taxonomy_url: str, name: str):
     if not name or not name.strip():
